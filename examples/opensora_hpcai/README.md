@@ -12,12 +12,12 @@ This repository is built on the models and code released by HPC-AI Tech. We are 
 
 ## 📰 News & States
 
-| Official News from HPC-AI Tech                                                                                                                                                                                                                                                                                                                                                | MindSpore Support                              |
-|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|
-| **[2024.04.25]** 🤗 HPC-AI Tech released the [Gradio demo for Open-Sora](https://huggingface.co/spaces/hpcai-tech/open-sora) on Hugging Face Spaces.                                                                                                                                                                                                                          | N.A.                                           |
-| **[2024.04.25]** 🔥 HPC-AI Tech released **Open-Sora 1.1**, which supports **2s~15s, 144p to 720p, any aspect ratio** text-to-image, **text-to-video, image-to-video, video-to-video, infinite time** generation. In addition, a full video processing pipeline is released. [[checkpoints]]() [[report]](https://github.com/hpcaitech/Open-Sora/blob/main/docs/report_02.md) | Image/Video-to-Video, Infinite time generation |
-| **[2024.03.18]** HPC-AI Tech released **Open-Sora 1.0**, a fully open-source project for video generation.                                                                                                                                                                                                                                                                    | ✅ VAE + STDiT training and inference           |
-| **[2024.03.04]** HPC-AI Tech Open-Sora provides training with 46% cost reduction [[blog]](https://hpc-ai.com/blog/open-sora)                                                                                                                                                                                                                                                  | ✅ Parallel training on Ascend devices          |
+| Official News from HPC-AI Tech                                                                                                                                                                                                                                                                                                                                                | MindSpore Support                                                                              |
+|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| **[2024.04.25]** 🤗 HPC-AI Tech released the [Gradio demo for Open-Sora](https://huggingface.co/spaces/hpcai-tech/open-sora) on Hugging Face Spaces.                                                                                                                                                                                                                          | N.A.                                                                                           |
+| **[2024.04.25]** 🔥 HPC-AI Tech released **Open-Sora 1.1**, which supports **2s~15s, 144p to 720p, any aspect ratio** text-to-image, **text-to-video, image-to-video, video-to-video, infinite time** generation. In addition, a full video processing pipeline is released. [[checkpoints]]() [[report]](https://github.com/hpcaitech/Open-Sora/blob/main/docs/report_02.md) | Image/Video-to-Video; Infinite time generation; Variable resolutions, aspect ratios, durations |
+| **[2024.03.18]** HPC-AI Tech released **Open-Sora 1.0**, a fully open-source project for video generation.                                                                                                                                                                                                                                                                    | ✅ VAE + STDiT training and inference                                                           |
+| **[2024.03.04]** HPC-AI Tech Open-Sora provides training with 46% cost reduction [[blog]](https://hpc-ai.com/blog/open-sora)                                                                                                                                                                                                                                                  | ✅ Parallel training on Ascend devices                                                          |
 
 
 
@@ -91,8 +91,9 @@ Videos are downsampled to `.gif` for display. Click for original videos. Prompts
 ## 🔆 Features
 
 - 📍 **Open-Sora 1.1** with the following features
-    - ✅ Improved ST-DiT architecture includes rope positional encoding, qk norm, longer text length, etc.
+    - ✅ Improved ST-DiT architecture includes Rotary Position Embedding (RoPE), QK Normalization, longer text length, etc.
     - ✅ Support image and video conditioning and video editing, and thus support animating images, connecting videos, etc.
+    - ✅ Support training with any resolution, aspect ratio, and duration.
 
 - 📍 **Open-Sora 1.0** with the following features
     - ✅ Text-to-video generation in 256x256 or 512x512 resolution and up to 64 frames.
@@ -111,9 +112,6 @@ Videos are downsampled to `.gif` for display. Click for original videos. Prompts
 </details>
 
 ### TODO
-* [ ] Support OpenSora 1.1 **[WIP]**
-    - [x] Support image and video conditioning.
-    - [ ] Support variable aspect ratios, resolutions, and durations.
 * [ ] Optimizer-parallel and sequence-parallel training **[WIP]**
 * [ ] Scaling model parameters and dataset size.
 
@@ -145,9 +143,8 @@ Other useful documents and links are listed below.
 
 ## Installation
 
-1. Install MindSpore 2.3rc1 according to the [official instruction](https://www.mindspore.cn/install)
-> To use flash attention, it's recommended to use mindspore 2.3rc2 (release soon).
-
+1. Install MindSpore according to the [official instructions](https://www.mindspore.cn/install).
+    For Ascend devices, please install **CANN driver C18 (0517)** from [here](https://repo.mindspore.cn/ascend/ascend910/20240517/) and install **MindSpore 2.3-master (0615)** from [here](https://repo.mindspore.cn/mindspore/mindspore/version/202406/20240615/master_20240615020018_43ccb91e45899b64fe31d304497ab17e3ada3cea_newest/unified/).
 
 2. Install requirements
 ```bash
@@ -245,14 +242,24 @@ parameters is 724M. More information about training can be found in HPC-AI Tech'
 
 ### Open-Sora 1.1 Command Line Inference
 
-#### Image/Video-to-Video Generation
+#### Image/Video-to-Video Generation (supports text guidance)
 
 ```shell
-python scripts/inference_i2v.py --config configs/opensora-v1-1/inference/sample.yaml --ckpt_path /path/to/your/opensora-v1-1.ckpt
+python scripts/inference.py --config configs/opensora-v1-1/inference/sample_iv2v.yaml --ckpt_path /path/to/your/opensora-v1-1.ckpt
 ```
+> for parallel inference, please use `mpirun` or `msrun`, and append `--use_parallel=True` to the inference script referring to `scripts/run/run_infer_os_v1.1_t2v_parallel.sh`
 
-In the `sample.yaml`, provide such information as `loop`, `condition_frame_length`, `captions`, `mask_strategy`, and `reference_path`.
-See [here](docs/quick_start.md#imagevideo-to-video) for more details.
+In the `sample_iv2v.yaml`, provide such information as `loop`, `condition_frame_length`, `captions`, `mask_strategy`,
+and `reference_path`. See [here](docs/quick_start.md#imagevideo-to-video) for more details.
+
+#### Text-to-Video Generation
+
+To generate a video from text, you can use `sample_t2v.yaml` or set `--reference_path` to an empty string `''`
+when using `sample_iv2v.yaml`.
+
+```shell
+python scripts/inference.py --config configs/opensora-v1-1/inference/sample_t2v.yaml --ckpt_path /path/to/your/opensora-v1-1.ckpt
+```
 
 ### Open-Sora 1.0 Command Line Inference
 
@@ -260,16 +267,17 @@ You can run text-to-video inference via the script `scripts/inference.py` as fol
 
 ```bash
 # Sample 16x256x256 videos
-python scripts/inference.py --config configs/opensora/inference/stdit_256x256x16.yaml --ckpt_path models/OpenSora-v1-16x256x256.ckpt --prompt_path /path/to/prompt.txt
+python scripts/inference.py --config configs/opensora/inference/stdit_256x256x16.yaml --ckpt_path models/OpenSora-v1-HQ-16x256x256.ckpt --prompt_path /path/to/prompt.txt
 
 # Sample 16x512x512 videos
-python scripts/inference.py --config configs/opensora/inference/stdit_512x512x16.yaml --ckpt_path models/OpenSora-v1-16x512x512.ckpt --prompt_path /path/to/prompt.txt
+python scripts/inference.py --config configs/opensora/inference/stdit_512x512x16.yaml --ckpt_path models/OpenSora-v1-HQ-16x512x512.ckpt --prompt_path /path/to/prompt.txt
 
 # Sample 64x512x512 videos
 python scripts/inference.py --config configs/opensora/inference/stdit_512x512x64.yaml --ckpt_path /path/to/your/opensora-v1.ckpt --prompt_path /path/to/prompt.txt
 ```
+> For parallel inference, please use `mpirun` or `msrun`, and append `--use_parallel=True` to the inference script referring to `scripts/run/run_infer_t2v_parallel.sh`
 
-We also provide a three-stage sampling script `run_sample_3stages.sh` to reduce memory limitation, which decomposes the whole pipeline into text embedding, text-to-video latent sampling, and vae decoding.
+We also provide a three-stage sampling script `run_sole_3stages.sh` to reduce memory limitation, which decomposes the whole pipeline into text embedding, text-to-video latent sampling, and vae decoding.
 
 For more usage on the inference script, please run `python scripts/inference.py -h`
 
@@ -304,6 +312,7 @@ video,caption
 video_folder/part01/vid001.mp4,a cartoon character is walking through
 video_folder/part01/vid002.mp4,a red and white ball with an angry look on its face
 ```
+</details>
 
 
 ### Cache Text Embeddings
@@ -314,7 +323,11 @@ For acceleration, we pre-compute the t5 embedding before training stdit.
 python scripts/infer_t5.py \
     --csv_path /path/to/video_caption.csv \
     --output_path /path/to/text_embed_folder \
+    --model_max_length 200 # For OpenSora v1.1
 ```
+
+OpenSora v1 uses text embedding sequence length of 120 (by default).
+If you want to generate text embeddings for OpenSora v1.1, please change `model_max_length` to 200.
 
 After running, the text embeddings saved as npz file for each caption will be in `output_path`. Please change `csv_path` to your video-caption annotation file accordingly.
 
@@ -323,13 +336,16 @@ After running, the text embeddings saved as npz file for each caption will be in
 If the storage budget is sufficient, you may also cache the video embedding by
 
 ```bash
-python scripts/infer_vae.py\
+python scripts/infer_vae.py \
     --csv_path /path/to/video_caption.csv  \
     --video_folder /path/to/video_folder  \
     --output_path /path/to/video_embed_folder  \
     --vae_checkpoint models/sd-vae-ft-ema.ckpt \
     --image_size 512 \
 ```
+> for parallel running, please refer to `scripts/run/run_infer_vae_parallel.sh`
+
+For more usage, please check `python scripts/infer_vae.py -h`
 
 After running, the vae latents saved as npz file for each video will be in `output_path`.
 
@@ -364,6 +380,31 @@ Finally, the training data should be like follows.
 │       ├── vid001.npz
 │       ├── vid002.npz
 │       └── ...
+
+```
+
+Each npz file contains data for the following keys:
+- `latent_mean` mean of vae latent distribution
+- `latent_std`: std of vae latent distribution
+- `fps`: video fps
+- `ori_size`: original size (h, w) of the video
+
+After caching VAE, you can use them for STDiT training by parsing `--vae_latent_folder=/path/to/video_embed_folder` to the training script `python train.py`.
+
+#### Cache VAE for multi-resolutions (for OpenSora 1.1)
+
+If there are multiple folders named in `latent_{h}x{w}` format under the `--vae_latent_folder` folder (which is parsed to train.py), one of resolutions will selected randomly during training. For example:
+
+```
+video_embed_folder
+   ├── latent_576x1024
+   │   ├── vid001.npz
+   │   ├── vid002.npz
+   │   └── ...
+   └── latent_1024x576
+       ├── vid001.npz
+       ├── vid002.npz
+       └── ...
 ```
 
 </details>
@@ -375,9 +416,6 @@ Finally, the training data should be like follows.
 Stand-alone training for Stage 1 of OpenSora v1.1:
 
 ```shell
-export MS_ENABLE_ACLNN=1
-export GRAPH_OP_RUN=1
-
 python scripts/train.py --config configs/opensora-v1-1/train/train_stage1.yaml \
     --csv_path /path/to/video_caption.csv \
     --video_folder /path/to/video_folder \
@@ -391,9 +429,6 @@ You can find more in [T5 text embeddings](#cache-text-embeddings) and [VAE Video
 For parallel training, use `msrun` and along with `--use_parallel=True`:
 
 ```shell
-export MS_ENABLE_ACLNN=1
-export GRAPH_OP_RUN=1
-
 msrun --master_port=8200 --worker_num=8 --local_worker_num=8 --log_dir=$output_dir  \
     python scripts/train.py --config configs/opensora-v1-1/train/train_stage1.yaml \
     --csv_path /path/to/video_caption.csv \
@@ -402,6 +437,15 @@ msrun --master_port=8200 --worker_num=8 --local_worker_num=8 --log_dir=$output_d
     --vae_latent_folder /path/to/video_embed_folder \
     --use_parallel True
 ```
+
+#### Multi-Resolution Training
+
+OpenSora v1.1 supports training with multiple resolutions, aspect ratios, and a variable number of frames.
+This can be enabled in one of two ways:
+
+1. Provide variable sized VAE embeddings with the `--vae_latent_folder` option.
+2. Use `bucket_config` for training with videos in their original format. More on the bucket configuration can be found
+   in [Multi-resolution Training with Buckets](./docs/quick_start.md#4-multi-resolution-training-with-buckets-opensora-v11-only).
 
 
 ### Open-Sora 1.0 Training
@@ -443,9 +487,39 @@ You may also see the example shell scripts in `scripts/run` for quick reference.
 
 We evaluated the training performance on MindSpore and Ascend NPUs. The results are as follows.
 
-| Model       | Context      | Precision | BS | NPUs | Resolution | Train T. (s/step) |
-|:------------|:-------------|:----------|:--:|:----:|:----------:|:-----------------:|
-| STDiT2-XL/2 | D910\*-MS2.3 | BF16      | 1  |  1   | 16x512x512 |       2.80        |
+| Model       | Context      | jit_level | Precision | BS | NPUs | Resolution(framesxHxW) | Train T. (s/step) |
+|:------------|:-------------|:--------|:---------:|:--:|:----:|:----------------------:|:-----------------:|
+| STDiT2-XL/2 | D910\*-MS2.3 |    O1  |    BF16   |  1 |  8   |       16x512x512       |        2.00       |
+| STDiT2-XL/2 | D910\*-MS2.3 |    O1  |    BF16   |  1 |  8   |       64x512x512       |        8.30       |
+| STDiT2-XL/2 | D910\*-MS2.3 |    O1  |    BF16   |  1 |  8   |       24x576x1024      |        8.22       |
+| STDiT2-XL/2 | D910\*-MS2.3 |    O1  |    BF16   |  1 |  8   |       64x576x1024      |        21.15      |
+| STDiT2-XL/2 | D910\*-MS2.3 |    O1  |    BF16   |  1 |  8   |       24x1024x1024     |        16.98      |
+> Context: {G:GPU, D:Ascend}{chip type}-{mindspore version}.
+
+>Note that the above performance uses both t5 cached embedding data and vae cached latent data.
+
+** Tips ** for performance optimization: to speed up training, you can set `dataset_sink_mode` as True and reduce `num_recompute_blocks` from 28 to a number that doesn't lead to out-of-memory.
+
+Here are some generation results after fine-tuning STDiT2 on small dataset.
+
+<table class="center">
+<tr>
+  <td width=50% style="text-align:center;"><b>576x1024x48</b></td>
+  <td width=50% style="text-align:center;"><b>576x1024x48</b></td>
+  </tr>
+<tr>
+  <td width=50%><video src="https://github.com/mindspore-lab/mindone/assets/52945530/4df1dabf-1a7c-45d9-b005-08f6c2d26dfe" autoplay></td>
+  <td width=50%><video src="https://github.com/mindspore-lab/mindone/assets/52945530/6e735171-042f-4b8d-a12c-4ddd5b2b4382" autoplay></td>
+</tr>
+<tr>
+  <td width=50% style="text-align:center;"><b>576x1024x48</b></td>
+  <td width=50% style="text-align:center;"><b>576x1024x48</b></td>
+  </tr>
+<tr>
+  <td width=50%><video src="https://github.com/mindspore-lab/mindone/assets/52945530/ab627b2c-d932-4c9d-84f4-afe0c9d5d5ce" autoplay></td>
+  <td width=50%><video src="https://github.com/mindspore-lab/mindone/assets/52945530/532f9d62-9b16-44dc-bd7a-4a24bd930e21" autoplay></td>
+</tr>
+</table>
 
 
 ### Open-Sora 1.0
@@ -486,22 +560,95 @@ Note that training on 300 frames at 512x512 resolution is achieved by optimizati
 
 #### Text-to-Video Generation after Fine-tuning
 
-Here are some generation results after fine-tuning STDiT on a subset of WebVid dataset in 512x512x64 resolution.
+Here are some generation results after fine-tuning STDiT on a subset of WebVid dataset.
 
-https://github.com/SamitHuang/mindone/assets/8156835/f00ad2bd-56e7-448c-9f85-c58888dca609
+<table class="center">
+<tr>
+  <td width=33% style="text-align:center;"><b>512x512x64</b></td>
+  <td width=33% style="text-align:center;"><b>512x512x64</b></td>
+  <td width=33% style="text-align:center;"><b>512x512x64</b></td>
+</tr>
+<tr>
+  <td width=33%><video src="https://github.com/SamitHuang/mindone/assets/8156835/c82c059f-57da-44e5-933b-66ccf9e59ea0"></td>
+  <td width=33%><video src="https://github.com/SamitHuang/mindone/assets/8156835/f00ad2bd-56e7-448c-9f85-c58888dca609"></td>
+  <td width=33%><video src="https://github.com/SamitHuang/mindone/assets/8156835/51b4a431-195b-4a53-b177-e58a7aa7276c"></td>
+</tr>
+</table>
 
-Prompt: The girl received flowers as a gift. a gift for my birthday. the guy gave a girl flowers
-
-https://github.com/SamitHuang/mindone/assets/8156835/c82c059f-57da-44e5-933b-66ccf9e59ea0
-
-Prompt: Cloudy moscow kremlin time lapse
-
-https://github.com/SamitHuang/mindone/assets/8156835/51b4a431-195b-4a53-b177-e58a7aa7276c
-
-Prompt: A baker turns freshly baked loaves of sourdough bread
 
 #### Quality Evaluation
 For quality evaluation, please refer to the original HPC-AI Tech [evaluation doc](https://github.com/hpcaitech/Open-Sora/blob/main/eval/README.md) for video generation quality evaluation.
+
+
+## Training and Inference Using the FiT-Like Pipeline
+
+We provide support for training Open-Sora 1.1 using the FiT-Like pipeline as an alternative solution for handling multi-resolution videos, in contrast to the bucketing strategy.
+
+### FiT-Like Training
+
+To begin, we need to prepare the VAE (Variational Autoencoder) latents from multi-resolution videos. For instance, if you intend to train at a resolution of up to 512x512 pixels, please run
+
+```bash
+python script/infer_vae.py \
+    --csv_path /path/to/video_caption.csv  \
+    --video_folder /path/to/video_folder  \
+    --output_path /path/to/video_embed_folder  \
+    --vae_checkpoint models/sd-vae-ft-ema.ckpt \
+    --image_size 512 \
+    --resize_by_max_value True \
+    --vae-micro-batch-size 1
+    --mode 1
+```
+
+The extracted VAE latent will be saved in the video embedding folder.
+
+Then, to launch a distributed training with eight NPU cards, please run
+
+```bash
+msrun --worker_num=8 --local_worker_num=8  \
+    scripts/train.py --config configs/opensora-v1-1/train/train_stage1_fit.yaml \
+    --csv_path /path/to/video_caption.csv \
+    --video_folder /path/to/video_folder \
+    --text_embed_folder /path/to/text_embed_folder \
+    --vae_latent_folder /path/to/video_embed_folder \
+    --use_parallel True \
+    --max_image_size 512 \
+```
+
+We evaluated the training performance on MindSpore and Ascend NPUs. The results are as follows.
+
+| Model       | Context      | Precision | BS | NPUs | Max. Resolution | Train T. (s/step) |
+|:------------|:-------------|:----------|:--:|:----:|:---------------:|:-----------------:|
+| STDiT2-XL/2 | D910\*-MS2.3_master | BF16      | 1  |  4   | 16x512x512      |       2.3         |
+
+
+### FiT-Like Inference
+
+To sample a video with a resolution of 384x672 using the trained checkpoint. You can run
+
+```bash
+python scripts/inference_i2v.py --config configs/opensora-v1-1/inference/t2v_fit.yaml \
+    --ckpt_path /path/to/your/opensora-v1-1.ckpt \
+    --prompt_path /path/to/prompt.txt \
+    --image_size 384 672 \
+    --max_image_size 512 \
+```
+
+Make sure that the `max_image_size` parameter remains consistent between your training and inference commands.
+
+Here are some generation results after fine-tuning STDiT on small dataset:
+
+<table class="center">
+<tr>
+  <td style="text-align:center;"><b>384x672x16</b></td>
+  <td style="text-align:center;"><b>672x384x16</b></td>
+</tr>
+<tr>
+  <td><video src="https://github.com/zhtmike/mindone/assets/8342575/97d8f37d-8ac3-49a8-af6d-5103f299e481" autoplay></td>
+  <td><video src="https://github.com/zhtmike/mindone/assets/8342575/abefa666-8e88-4eef-974e-a4d4bfa1cd53" autoplay></td>
+</tr>
+</table>
+
 
 
 ## Contribution

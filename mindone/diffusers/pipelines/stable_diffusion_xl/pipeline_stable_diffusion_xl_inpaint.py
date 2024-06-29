@@ -25,7 +25,12 @@ from mindspore import ops
 from mindone.transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPVisionModelWithProjection
 
 from ...image_processor import PipelineImageInput, VaeImageProcessor
-from ...loaders import StableDiffusionXLLoraLoaderMixin
+from ...loaders import (
+    FromSingleFileMixin,
+    IPAdapterMixin,
+    StableDiffusionXLLoraLoaderMixin,
+    TextualInversionLoaderMixin,
+)
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import deprecate, logging, scale_lora_layers, unscale_lora_layers
@@ -216,7 +221,7 @@ def retrieve_latents(vae, encoder_output: ms.Tensor, sample_mode: str = "sample"
     if sample_mode == "sample":
         return vae.diag_gauss_dist.sample(encoder_output)
     elif sample_mode == "argmax":
-        return vae.diag_gauss_dist.sample(encoder_output).argmax()
+        return vae.diag_gauss_dist.mode(encoder_output)
     # This branch is not needed because the encoder_output type is ms.Tensor as per AutoencoderKLOutput change
     # elif hasattr(encoder_output, "latents"):
     #     return encoder_output.latents
@@ -266,7 +271,13 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusionXLInpaintPipeline(DiffusionPipeline, StableDiffusionXLLoraLoaderMixin):
+class StableDiffusionXLInpaintPipeline(
+    DiffusionPipeline,
+    FromSingleFileMixin,
+    IPAdapterMixin,
+    StableDiffusionXLLoraLoaderMixin,
+    TextualInversionLoaderMixin,
+):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion XL.
 

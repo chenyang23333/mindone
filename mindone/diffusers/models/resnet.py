@@ -18,7 +18,7 @@ from typing import Optional, Tuple, Union
 import mindspore as ms
 from mindspore import nn, ops
 
-from .activations import get_activation
+from .activations import SiLU, get_activation
 from .attention_processor import SpatialNorm
 from .downsampling import Downsample1D, Downsample2D, FirDownsample2D, KDownsample2D, downsample_2d  # noqa
 from .normalization import AdaGroupNorm, GroupNorm
@@ -144,7 +144,7 @@ class ResnetBlockCondNorm2D(nn.Cell):
                 has_bias=conv_shortcut_bias,
             )
 
-    def construct(self, input_tensor: ms.Tensor, temb: ms.Tensor, *args, **kwargs) -> ms.Tensor:
+    def construct(self, input_tensor: ms.Tensor, temb: ms.Tensor) -> ms.Tensor:
         hidden_states = input_tensor
 
         hidden_states = self.norm1(hidden_states, temb)
@@ -487,24 +487,24 @@ class TemporalConvLayer(nn.Cell):
         # conv layers
         self.conv1 = nn.SequentialCell(
             GroupNorm(norm_num_groups, in_dim),
-            nn.SiLU(),
+            SiLU(),
             nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding=(1, 1, 0, 0, 0, 0), pad_mode="pad", has_bias=True),
         )
         self.conv2 = nn.SequentialCell(
             GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
+            SiLU(),
             nn.Dropout(p=dropout),
             nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 1, 0, 0, 0, 0), pad_mode="pad", has_bias=True),
         )
         self.conv3 = nn.SequentialCell(
             GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
+            SiLU(),
             nn.Dropout(p=dropout),
             nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding=(1, 1, 0, 0, 0, 0), pad_mode="pad", has_bias=True),
         )
         self.conv4 = nn.SequentialCell(
             GroupNorm(norm_num_groups, out_dim),
-            nn.SiLU(),
+            SiLU(),
             nn.Dropout(p=dropout),
             nn.Conv3d(
                 out_dim,

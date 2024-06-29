@@ -27,7 +27,7 @@ from mindone.transformers import CLIPTextModel, CLIPVisionModelWithProjection
 
 from ...configuration_utils import FrozenDict
 from ...image_processor import PipelineImageInput, VaeImageProcessor
-from ...loaders import LoraLoaderMixin
+from ...loaders import FromSingleFileMixin, IPAdapterMixin, LoraLoaderMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, ImageProjection, UNet2DConditionModel
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import PIL_INTERPOLATION, deprecate, logging, scale_lora_layers, unscale_lora_layers
@@ -69,7 +69,7 @@ def retrieve_latents(vae, encoder_output: ms.Tensor, sample_mode: str = "sample"
     if sample_mode == "sample":
         return vae.diag_gauss_dist.sample(encoder_output)
     elif sample_mode == "argmax":
-        return vae.diag_gauss_dist.sample(encoder_output).argmax()
+        return vae.diag_gauss_dist.mode(encoder_output)
     # This branch is not needed because the encoder_output type is ms.Tensor as per AutoencoderKLOutput change
     # elif hasattr(encoder_output, "latents"):
     #     return encoder_output.latents
@@ -141,7 +141,13 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusionImg2ImgPipeline(DiffusionPipeline, LoraLoaderMixin):
+class StableDiffusionImg2ImgPipeline(
+    DiffusionPipeline,
+    IPAdapterMixin,
+    TextualInversionLoaderMixin,
+    LoraLoaderMixin,
+    FromSingleFileMixin,
+):
     r"""
     Pipeline for text guided image-to-image generation using Stable Diffusion.
 

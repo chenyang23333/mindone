@@ -17,13 +17,14 @@ import mindspore as ms
 from mindspore import nn
 
 from ...configuration_utils import ConfigMixin, register_to_config
+from ...loaders import FromOriginalVAEMixin
 from ..attention_processor import CROSS_ATTENTION_PROCESSORS, AttentionProcessor, AttnProcessor
 from ..modeling_outputs import AutoencoderKLOutput
 from ..modeling_utils import ModelMixin
 from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
 
 
-class AutoencoderKL(ModelMixin, ConfigMixin):
+class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -71,9 +72,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         norm_num_groups: int = 32,
         sample_size: int = 32,
         scaling_factor: float = 0.18215,
+        shift_factor: Optional[float] = None,
         force_upcast: float = True,
         latents_mean: Optional[Tuple[float]] = None,
         latents_std: Optional[Tuple[float]] = None,
+        use_quant_conv: bool = True,
+        use_post_quant_conv: bool = True,
     ):
         super().__init__()
 
@@ -100,8 +104,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             act_fn=act_fn,
         )
 
-        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1, has_bias=True)
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1, has_bias=True)
+        self.quant_conv = (
+            nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1, has_bias=True) if use_quant_conv else None
+        )
+        self.post_quant_conv = (
+            nn.Conv2d(latent_channels, latent_channels, 1, has_bias=True) if use_post_quant_conv else None
+        )
         self.diag_gauss_dist = DiagonalGaussianDistribution()
 
         self.use_slicing = False
@@ -136,12 +144,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             if hasattr(module, "get_processor"):
                 processors[f"{name}.processor"] = module.get_processor()
 
-            for sub_name, child in module.name_cells():
+            for sub_name, child in module.name_cells().items():
                 fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
 
             return processors
 
-        for name, module in self.name_cells():
+        for name, module in self.name_cells().items():
             fn_recursive_add_processors(name, module, processors)
 
         return processors
@@ -175,10 +183,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
                 else:
                     module.set_processor(processor.pop(f"{name}.processor"))
 
-            for sub_name, child in module.name_cells():
+            for sub_name, child in module.name_cells().items():
                 fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
 
-        for name, module in self.name_cells():
+        for name, module in self.name_cells().items():
             fn_recursive_attn_processor(name, module, processor)
 
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_default_attn_processor
@@ -210,7 +218,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         """
         h = self.encoder(x)
 
-        moments = self.quant_conv(h)
+        if self.quant_conv is not None:
+            moments = self.quant_conv(h)
+        else:
+            moments = h
         # we cannot use class in graph mode, even for jit_class or subclass of Tensor. :-(
         # posterior = DiagonalGaussianDistribution(moments)
 
@@ -220,7 +231,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         return AutoencoderKLOutput(latent=moments)
 
     def _decode(self, z: ms.Tensor, return_dict: bool = False) -> Union[DecoderOutput, Tuple[ms.Tensor]]:
-        z = self.post_quant_conv(z)
+        if self.post_quant_conv is not None:
+            z = self.post_quant_conv(z)
         dec = self.decoder(z)
 
         if not return_dict:

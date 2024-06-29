@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(__dir__, "..")))
 from args_train import parse_args
 from opensora.models.stdit import STDiT2_XL_2, STDiT_XL_2
 from opensora.models.vae.vae import SD_CONFIG, AutoencoderKL
-from opensora.pipelines import DiffusionWithLoss
+from opensora.pipelines import DiffusionWithLoss, DiffusionWithLossFiTLike
 from opensora.schedulers.iddpm import create_diffusion
 from opensora.utils.amp import auto_mixed_precision
 
@@ -53,7 +53,7 @@ def init_env(
     max_device_memory: str = None,
     device_target: str = "Ascend",
     parallel_mode: str = "data",
-    enable_dvm: bool = False,
+    jit_level: str = "O0",
     global_bf16: bool = False,
     debug: bool = False,
 ) -> Tuple[int, int]:
@@ -116,10 +116,18 @@ def init_env(
             pynative_synchronize=debug,
         )
 
-    if enable_dvm:
-        print("enable dvm")
-        # FIXME: the graph_kernel_flags settting is a temp solution to fix dvm loss convergence in ms2.3-rc2. Refine it for future ms version.
-        ms.set_context(enable_graph_kernel=True, graph_kernel_flags="--disable_cluster_ops=Pow,Select")
+    try:
+        if jit_level in ["O0", "O1", "O2"]:
+            ms.set_context(jit_config={"jit_level": jit_level})
+        else:
+            logger.warning(
+                f"Unsupport jit_level: {jit_level}. The framework automatically selects the execution method"
+            )
+    except Exception:
+        logger.warning(
+            "The current jit_level is not suitable because current MindSpore version or mode does not match,"
+            "please ensure the MindSpore version >= ms2.3_0615, and use GRAPH_MODE."
+        )
 
     if global_bf16:
         ms.set_context(ascend_config={"precision_mode": "allow_mix_precision_bf16"})
@@ -157,7 +165,7 @@ def main(args):
         device_target=args.device_target,
         max_device_memory=args.max_device_memory,
         parallel_mode=args.parallel_mode,
-        enable_dvm=args.enable_dvm,
+        jit_level=args.jit_level,
         global_bf16=args.global_bf16,
         debug=args.debug,
     )
@@ -171,20 +179,27 @@ def main(args):
     img_h, img_w = args.image_size if isinstance(args.image_size, list) else (args.image_size, args.image_size)
     if args.model_version == "v1":
         assert img_h == img_w, "OpenSora v1 support square images only."
+    if args.pre_patchify:
+        img_h, img_w = args.max_image_size, args.max_image_size
 
     input_size = (
         args.num_frames // VAE_T_COMPRESS,
         img_h // VAE_S_COMPRESS,
         img_w // VAE_S_COMPRESS,
     )
+    patchify_conv3d_replace = "linear" if args.pre_patchify else args.patchify
     model_extra_args = dict(
         input_size=input_size,
         in_channels=VAE_Z_CH,
         model_max_length=args.model_max_length,
-        patchify_conv3d_replace="conv2d",  # for Ascend
+        patchify_conv3d_replace=patchify_conv3d_replace,  # for Ascend
         enable_flashattn=args.enable_flash_attention,
         use_recompute=args.use_recompute,
     )
+
+    if args.pre_patchify and args.model_version != "v1.1":
+        raise ValueError("`pre_patchify=True` can only be used in model version 1.1.")
+
     if args.model_version == "v1":
         model_extra_args.update(
             {
@@ -200,9 +215,10 @@ def main(args):
             {
                 "input_sq_size": 512,
                 "qk_norm": True,
+                "num_recompute_blocks": args.num_recompute_blocks,
             }
         )
-        logger.info(f"STDiT2 input size: {input_size}")
+        logger.info(f"STDiT2 input size: {input_size if args.bucket_config is None else 'Variable'}")
         latte_model = STDiT2_XL_2(**model_extra_args)
     else:
         raise ValueError(f"Unknown model version: {args.model_version}")
@@ -224,6 +240,15 @@ def main(args):
     else:
         logger.info("Use random initialization for Latte")
     latte_model.set_train(True)
+
+    if input_size[1] % latte_model.patch_size[1] != 0 or input_size[2] % latte_model.patch_size[2] != 0:
+        height_ = latte_model.patch_size[1] * VAE_S_COMPRESS
+        width_ = latte_model.patch_size[2] * VAE_S_COMPRESS
+        msg = f"Image height ({img_h}) and width ({img_w}) should be divisible by {height_} and {width_} respectively."
+        if patchify_conv3d_replace == "linear":
+            raise ValueError(msg)
+        else:
+            logger.warning(msg)
 
     # 2.2 vae
     # TODO: use mindone/models/autoencoders in future
@@ -255,18 +280,24 @@ def main(args):
     # 2.3 ldm with loss
     logger.info(f"Train with vae latent cache: {train_with_vae_latent}")
     diffusion = create_diffusion(timestep_respacing="")
-    latent_diffusion_with_loss = DiffusionWithLoss(
-        latte_model,
-        diffusion,
-        vae=vae,
+    pipeline_kwargs = dict(
         scale_factor=args.sd_scale_factor,
-        condition="text",
-        text_encoder=None,
         cond_stage_trainable=False,
         text_emb_cached=True,
         video_emb_cached=train_with_vae_latent,
         micro_batch_size=args.vae_micro_batch_size,
     )
+    if args.pre_patchify:
+        additional_pipeline_kwargs = dict(
+            patch_size=latte_model.patch_size,
+            max_image_size=args.max_image_size,
+            vae_downsample_rate=8.0,
+            in_channels=latte_model.in_channels,
+        )
+        pipeline_kwargs.update(additional_pipeline_kwargs)
+
+    pipeline_ = DiffusionWithLossFiTLike if args.pre_patchify else DiffusionWithLoss
+    latent_diffusion_with_loss = pipeline_(latte_model, diffusion, vae=vae, text_encoder=None, **pipeline_kwargs)
 
     # 3. create dataset
     dataloader = None
@@ -288,6 +319,7 @@ def main(args):
             video_column=args.video_column,
             caption_column=args.caption_column,
             disable_flip=args.disable_flip,
+            filter_data=args.filter_data,
         )
         dataloader = create_dataloader(
             ds_config,
@@ -299,12 +331,14 @@ def main(args):
             max_rowsize=args.max_rowsize,
         )
     elif args.model_version == "v1.1":
+        from opensora.datasets.bucket import Bucket, bucket_split_function
         from opensora.datasets.mask_generator import MaskGenerator
         from opensora.datasets.video_dataset_refactored import VideoDatasetRefactored
 
         from mindone.data import create_dataloader
 
         mask_gen = MaskGenerator(args.mask_ratios)
+        buckets = Bucket(args.bucket_config) if args.bucket_config is not None else None
 
         dataset = VideoDatasetRefactored(
             csv_path=args.csv_path,
@@ -315,12 +349,25 @@ def main(args):
             sample_n_frames=args.num_frames,
             sample_stride=args.frame_stride,
             frames_mask_generator=mask_gen,
+            buckets=buckets,
+            filter_data=args.filter_data,
             output_columns=["video", "caption", "mask", "fps", "num_frames", "frames_mask"],
+            pre_patchify=args.pre_patchify,
+            patch_size=latte_model.patch_size,
+            embed_dim=latte_model.hidden_size,
+            num_heads=latte_model.num_heads,
+            max_target_size=args.max_image_size,
+            input_sq_size=latte_model.input_sq_size,
+            in_channels=latte_model.in_channels,
         )
+
+        project_columns = ["video", "caption", "mask", "frames_mask", "num_frames", "height", "width", "fps", "ar"]
+        if args.pre_patchify:
+            project_columns.extend(["spatial_pos", "spatial_mask", "temporal_pos", "temporal_mask"])
 
         dataloader = create_dataloader(
             dataset,
-            batch_size=args.batch_size,
+            batch_size=args.batch_size if buckets is None else 0,  # Turn off batching if using buckets
             transforms=dataset.train_transforms(
                 target_size=(img_h, img_w), tokenizer=None  # Tokenizer isn't supported yet
             ),
@@ -332,8 +379,14 @@ def main(args):
             max_rowsize=args.max_rowsize,
             debug=args.debug,
             # Sort output columns to match DiffusionWithLoss input
-            project_columns=["video", "caption", "mask", "frames_mask", "num_frames", "height", "width", "fps", "ar"],
+            project_columns=project_columns,
         )
+
+        if buckets is not None:
+            hash_func, bucket_boundaries, bucket_batch_sizes = bucket_split_function(buckets)
+            dataloader = dataloader.bucket_batch_by_length(
+                ["video"], bucket_boundaries, bucket_batch_sizes, element_length_function=hash_func, drop_remainder=True
+            )
 
     dataset_size = dataloader.get_dataset_size()
 
@@ -505,9 +558,9 @@ def main(args):
                 f"Num trainable params: {num_params_trainable:,}",
                 f"Use model dtype: {args.dtype}",
                 f"Learning rate: {args.start_learning_rate}",
-                f"Batch size: {args.batch_size}",
-                f"Image size: {(img_h, img_w)}",
-                f"Frames: {args.num_frames}",
+                f"Batch size: {args.batch_size if args.bucket_config is None else 'Variable'}",
+                f"Image size: {(img_h, img_w) if args.bucket_config is None else 'Variable'}",
+                f"Frames: {args.num_frames if args.bucket_config is None else 'Variable'}",
                 f"Weight decay: {args.weight_decay}",
                 f"Grad accumulation steps: {args.gradient_accumulation_steps}",
                 f"Num epochs: {args.epochs}",

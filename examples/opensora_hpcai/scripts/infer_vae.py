@@ -36,7 +36,7 @@ def init_env(
     distributed: bool = False,
     max_device_memory: str = None,
     device_target: str = "Ascend",
-    enable_dvm: bool = False,
+    jit_level: str = "O0",
     global_bf16: bool = False,
 ):
     """
@@ -83,9 +83,18 @@ def init_env(
             device_target=device_target,
         )
 
-    if enable_dvm:
-        # FIXME: the graph_kernel_flags settting is a temp solution to fix dvm loss convergence in ms2.3-rc2. Refine it for future ms version.
-        ms.set_context(enable_graph_kernel=True, graph_kernel_flags="--disable_cluster_ops=Pow,Select")
+    try:
+        if jit_level in ["O0", "O1", "O2"]:
+            ms.set_context(jit_config={"jit_level": jit_level})
+        else:
+            logger.warning(
+                f"Unsupport jit_level: {jit_level}. The framework automatically selects the execution method"
+            )
+    except Exception:
+        logger.warning(
+            "The current jit_level is not suitable because current MindSpore version or mode does not match,"
+            "please ensure the MindSpore version >= ms2.3_0615, and use GRAPH_MODE."
+        )
 
     if global_bf16:
         ms.set_context(ascend_config={"precision_mode": "allow_mix_precision_bf16"})
@@ -100,6 +109,11 @@ def main(args):
     )
     print(f"rank_id {rank_id}, device_num {device_num}")
 
+    if args.resize_by_max_value and args.batch_size != 1:
+        raise ValueError(
+            f"Batch size must be 1 when `resize_by_max_value=True`, but get `batch_size={args.batch_size}`."
+        )
+
     # build dataloader for large amount of captions
     ds_config = dict(
         csv_path=args.csv_path,
@@ -110,6 +124,9 @@ def main(args):
         video_column=args.video_column,
         caption_column=args.caption_column,
         return_frame_data=args.dl_return_all_frames,
+        resize_by_max_value=args.resize_by_max_value,
+        transform_name=args.transform_name,
+        filter_data=args.filter_data,
     )
     dataloader, ds = create_dataloader(
         ds_config,
@@ -146,8 +163,8 @@ def main(args):
 
     logger.info("Start VAE embedding...")
 
-    def save_output(video_name, mean, std=None):
-        fn = Path(str(video_name)).with_suffix(".npz")
+    def save_output(video_name: Path, mean, std=None, fps=None, ori_size=None):
+        fn = video_name.with_suffix(".npz")
         npz_fp = os.path.join(output_folder, fn)
         if not os.path.exists(os.path.dirname(npz_fp)):
             os.makedirs(os.path.dirname(npz_fp))
@@ -159,11 +176,15 @@ def main(args):
                 npz_fp,
                 latent_mean=mean.astype(np.float32),
                 latent_std=std.astype(np.float32),
+                fps=fps,
+                ori_size=ori_size,
             )
         else:
             np.savez(
                 npz_fp,
                 latent_mean=video_latent_mean.astype(np.float32),
+                fps=fps,
+                ori_size=ori_size,
             )
         return npz_fp
 
@@ -185,11 +206,14 @@ def main(args):
             if args.dl_return_all_frames:
                 frame_data = data["frame_data"]
                 num_videos = frame_data.shape[0]
+                fps = data["fps"][0]
+                ori_size = data["ori_size"][0]
                 assert args.batch_size == 1, "batch size > 1 is not supported due to dynamic frame numbers among videos"
                 for i in range(num_videos):
-                    video_path = data["video_path"][i]
+                    abs_video_path = data["video_path"][i]
+                    video_path = Path(abs_video_path).relative_to(args.video_folder)
 
-                    fn = Path(str(video_path)).with_suffix(".npz")
+                    fn = video_path.with_suffix(".npz")
                     npz_fp = os.path.join(output_folder, fn)
                     if os.path.exists(npz_fp) and not args.allow_overwrite:
                         logger.info(f"{npz_fp} exists, skip vae encoding")
@@ -211,14 +235,14 @@ def main(args):
                     if args.save_distribution:
                         video_latent_std = np.concatenate(video_latent_std, axis=0)
 
-                    save_output(video_path, video_latent_mean, video_latent_std)
+                    save_output(video_path, video_latent_mean, video_latent_std, fps, ori_size)
             else:
                 num_videos = data["video_path"].shape[0]
                 for i in range(num_videos):
-                    video_path = data["video_path"][i]
-                    abs_video_path = os.path.join(args.video_folder, video_path)
+                    abs_video_path = data["video_path"][i]
+                    video_path = Path(abs_video_path).relative_to(args.video_folder)
 
-                    fn = Path(str(video_path)).with_suffix(".npz")
+                    fn = video_path.with_suffix(".npz")
                     npz_fp = os.path.join(output_folder, fn)
                     if os.path.exists(npz_fp) and not args.allow_overwrite:
                         logger.info(f"{npz_fp} exists, skip vae encoding")
@@ -226,20 +250,22 @@ def main(args):
 
                     video_latent_mean = []
                     video_latent_std = []
-
-                    for x_bs in ds.get_video_frames_in_batch(
+                    fps, ori_size = None, None
+                    for x_bs, fps, ori_size in ds.get_video_frames_in_batch(
                         abs_video_path, micro_batch_size=args.vae_micro_batch_size, sample_stride=args.frame_stride
                     ):
                         mean, std = ms.ops.stop_gradient(vae.encode_with_moments_output(ms.Tensor(x_bs, ms.float32)))
                         video_latent_mean.append(mean.asnumpy())
                         if args.save_distribution:
                             video_latent_std.append(std.asnumpy())
+                        fps = fps
+                        ori_size = ori_size
 
                     video_latent_mean = np.concatenate(video_latent_mean, axis=0)
                     if args.save_distribution:
                         video_latent_std = np.concatenate(video_latent_std, axis=0)
 
-                    save_output(video_path, video_latent_mean, video_latent_std)
+                    save_output(video_path, video_latent_mean, video_latent_std, fps, ori_size)
 
             end_time = time.time()
             logger.info(f"Time cost: {end_time-start_time:0.3f}s")
@@ -282,6 +308,7 @@ def parse_args():
         "--caption_column", default="caption", type=str, help="name of column for captions saved in csv file"
     )
     parser.add_argument("--video_folder", default="", type=str, help="root dir for the video data")
+    parser.add_argument("--filter_data", default=False, type=str2bool, help="Filter non-existing videos.")
     parser.add_argument("--image_size", nargs="+", default=[512, 512], type=int, help="image size")
     parser.add_argument(
         "--dl_return_all_frames",
@@ -325,6 +352,14 @@ def parse_args():
     )
     parser.add_argument("--frame_stride", default=1, type=int, help="frame sampling stride")
     parser.add_argument(
+        "--transform_name",
+        default="center",
+        type=str,
+        help="center or crop_resize, if center, resize by the short side to h \
+                then center crop. If crop_resize, center crop maximally according to \
+                the AR of target image size then resize, suitable for where target h != target w.",
+    )
+    parser.add_argument(
         "--vae_micro_batch_size",
         type=int,
         default=64,
@@ -349,6 +384,7 @@ def parse_args():
         help="If True, allow to overwrite the existing npz file. If False, will skip vae encoding if the latent npz file is already existed",
     )
     parser.add_argument("--batch_size", default=1, type=int, help="batch size")
+    parser.add_argument("--resize_by_max_value", default=False, type=str2bool, help="resize the image by max instead.")
 
     default_args = parser.parse_args()
     __dir__ = os.path.dirname(os.path.abspath(__file__))
