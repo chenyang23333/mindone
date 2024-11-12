@@ -6,10 +6,11 @@ from mindspore.communication import get_local_rank, get_local_rank_size
 from .dataset import BaseDataset
 
 
-def build_dataloader(
+def create_dataloader(
     dataset: BaseDataset,
-    batch_size: int,
+    batch_size: int = 1,
     transforms: Optional[Union[List[dict], dict]] = None,
+    project_columns: Optional[List[str]] = None,
     shuffle: bool = False,
     num_workers: int = 4,
     num_workers_dataset: int = 4,
@@ -28,7 +29,7 @@ def build_dataloader(
 
     Args:
         dataset: A dataset instance, must have `output_columns` member.
-        batch_size: Number of samples per batch.
+        batch_size: Number of samples per batch. Set to 0 to disable batching. Default is 1.
         transforms: Optional transformations to apply to the dataset. It can be a list of transform dictionaries or
                     a single transform dictionary. The dictionary must have the following structure:
                     {
@@ -36,6 +37,8 @@ def build_dataloader(
                         "input_columns": [List of columns to apply transforms to],  # Optional
                         "output_columns": [List of output columns]                  # Optional, only used if different from the `input columns`
                     }
+        project_columns: Optional list of output columns names from transformations.
+                         These names can be used for column selection or sorting in a specific order.
         shuffle: Whether to randomly sample data. Default is False.
         num_workers: The number of workers used for data transformations. Default is 4.
         num_workers_dataset: The number of workers used for reading data from the dataset. Default is 4.
@@ -59,7 +62,7 @@ def build_dataloader(
         raise AttributeError(f"{type(dataset).__name__} must have `output_columns` attribute.")
 
     ms.dataset.config.set_prefetch_size(prefetch_size)
-    ms.dataset.config.set_enable_shared_mem(True)
+    # ms.dataset.config.set_enable_shared_mem(True)   # shared memory is ON by default
     ms.dataset.config.set_debug_mode(debug)
 
     if enable_modelarts:
@@ -89,6 +92,21 @@ def build_dataloader(
                 max_rowsize=max_rowsize,
             )
 
-    dataloader = dataloader.batch(batch_size, drop_remainder=drop_remainder, num_parallel_workers=num_workers_batch)
+    if project_columns:
+        dataloader = dataloader.project(project_columns)
+
+    if getattr(dataset, "pad_info", None):
+        if batch_size > 0:
+            dataloader = dataloader.padded_batch(
+                batch_size,
+                drop_remainder=drop_remainder,
+                num_parallel_workers=num_workers_batch,
+                pad_info=dataset.pad_info,
+            )
+    else:
+        if batch_size > 0:
+            dataloader = dataloader.batch(
+                batch_size, drop_remainder=drop_remainder, num_parallel_workers=num_workers_batch
+            )
 
     return dataloader

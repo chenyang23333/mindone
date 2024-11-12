@@ -52,7 +52,7 @@ args = parser.parse_args()
 
 def _load_torch_ckpt(ckpt_file):
     source_data = torch.load(ckpt_file, map_location="cpu")
-    if ["state_dict"] in source_data:
+    if "state_dict" in source_data:
         source_data = source_data["state_dict"]
     return source_data
 
@@ -198,6 +198,7 @@ def np2ms_tensor(inp, force_fp32=True):
     ms_dtype = None
     if inp.dtype == np.float16 and force_fp32:
         ms_dtype = ms.float32
+    inp = np.array(inp)  # in case of type error
     out = ms.Tensor(inp, dtype=ms_dtype)
     return out
 

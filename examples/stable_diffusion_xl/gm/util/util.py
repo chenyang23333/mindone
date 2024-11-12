@@ -9,7 +9,17 @@ import mindspore as ms
 from mindspore import Tensor, nn, ops
 from mindspore.ops import composite as C
 from mindspore.ops import functional as F
-from mindspore.train.amp import AMP_BLACK_LIST, AMP_WHITE_LIST, _auto_black_list, _auto_white_list
+from mindspore.train.amp import AMP_BLACK_LIST, AMP_WHITE_LIST, _auto_black_list
+
+try:
+    from mindspore.train.amp import _auto_white_list
+
+    NEW_AUTO_WHITE = False
+except Exception:
+    # API changed since ms2.3-20240219
+    from mindspore.train.amp import _auto_mixed_precision_rewrite
+
+    NEW_AUTO_WHITE = True
 
 
 def exists(x):
@@ -77,7 +87,7 @@ def seed_everything(seed):
     ms.set_seed(seed)
 
 
-@ms.constexpr
+@ms.constexpr(reuse_result=False)
 def get_timestep_multinomial(p, size=1):
     p = p.asnumpy()
     out = np.random.multinomial(1, p / p.sum(), size=size).argmax(-1)
@@ -204,24 +214,21 @@ def auto_mixed_precision(network, amp_level="O0"):
     if amp_level == "O0":
         pass
     elif amp_level == "O1":
-        return _auto_white_list(network, AMP_WHITE_LIST)
+        if NEW_AUTO_WHITE:
+            return _auto_mixed_precision_rewrite(network, white_list=AMP_WHITE_LIST)
+        else:
+            return _auto_white_list(network, AMP_WHITE_LIST)
     elif amp_level == "O2":
         try:
             _auto_black_list(
                 network,
-                AMP_BLACK_LIST
-                + [
-                    nn.GroupNorm,
-                ],
+                AMP_BLACK_LIST + [nn.GroupNorm, nn.SiLU],
                 ms.float16,
             )
         except Exception:
             _auto_black_list(
                 network,
-                AMP_BLACK_LIST
-                + [
-                    nn.GroupNorm,
-                ],
+                AMP_BLACK_LIST + [nn.GroupNorm, nn.SiLU],
             )
     elif amp_level == "O3":
         network.to_float(ms.float16)

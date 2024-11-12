@@ -93,11 +93,21 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--train_config",
-        default="configs/train/sd15_controlnet.yaml",
+        default="configs/train/sd15_controlnet_canny.yaml",
         type=str,
         help="train config path to load a yaml file that override the default arguments",
     )
     parser.add_argument("--mode", default=0, type=int, help="Specify the mode: 0 for graph mode, 1 for pynative mode")
+    parser.add_argument(
+        "--jit_level",
+        default="O2",
+        type=str,
+        choices=["O0", "O1", "O2"],
+        help="Used to control the compilation optimization level. Supports ['O0', 'O1', 'O2']."
+        "O0: Except for optimizations that may affect functionality, all other optimizations are turned off, adopt KernelByKernel execution mode."
+        "O1: Using commonly used optimizations and automatic operator fusion optimizations, adopt KernelByKernel execution mode."
+        "O2: Ultimate performance optimization, adopt Sink execution mode.",
+    )
     parser.add_argument("--use_parallel", default=False, type=str2bool, help="use parallel")
     parser.add_argument("--use_recompute", default=None, type=str2bool, help="whether use recompute")
     parser.add_argument(
@@ -189,7 +199,15 @@ def parse_args():
         default="logging.INFO",
         help="log level, options: logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR",
     )
-
+    parser.add_argument(
+        "--controlnet_mode",
+        type=str,
+        default="canny",
+        help="control mode for controlnet, should be in [canny, segmentation, openpose]",
+    )
+    parser.add_argument(
+        "--group_lr_scaler", default=1.0, type=float, help="scaler for lr of a particular group of params"
+    )
     abs_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ""))
     default_args = parser.parse_args()
     if default_args.train_config:
@@ -211,10 +229,11 @@ def main(args):
         args.epochs = 3
 
     # init
-    device_id, rank_id, device_num = init_env(
+    rank_id, device_num = init_env(
         args.mode,
         seed=args.seed,
         distributed=args.use_parallel,
+        jit_level=args.jit_level,
         enable_modelarts=args.enable_modelarts,
         num_workers=args.num_workers,
         json_data_path=args.json_data_path,
@@ -241,6 +260,7 @@ def main(args):
         device_num=device_num,
         rank_id=rank_id,
         filter_small_size=args.filter_small_size,
+        control_type=args.controlnet_mode,
     )
 
     # lora injection
@@ -300,6 +320,7 @@ def main(args):
         betas=args.betas,
         weight_decay=args.weight_decay,
         lr=lr,
+        group_lr_scaler=args.group_lr_scaler,
     )
 
     loss_scaler = DynamicLossScaleUpdateCell(
@@ -314,7 +335,6 @@ def main(args):
     start_epoch = 0
     if args.resume:
         resume_ckpt = os.path.join(ckpt_dir, "train_resume.ckpt") if isinstance(args.resume, bool) else args.resume
-
         start_epoch, loss_scale, cur_iter, last_overflow_iter = resume_train_network(
             latent_diffusion_with_loss, optimizer, resume_ckpt
         )

@@ -1,4 +1,6 @@
 # reference to https://github.com/Stability-AI/generative-models
+import logging
+
 try:
     from typing import Literal
 except ImportError:
@@ -10,18 +12,21 @@ from gm.util import default, exists
 
 import mindspore as ms
 from mindspore import nn, ops
-from mindspore.ops._tracefunc import trace
 
 try:
-    from mindspore.nn.layer.flash_attention import FlashAttention
+    from mindone.models.modules.flash_attention import MSFlashAttention as FlashAttention
 
     # from mindspore.ops._op_impl._custom_op.flash_attention.flash_attention_impl import get_flash_attention
 
     FLASH_IS_AVAILABLE = True
     print("flash attention is available.")
 except ImportError:
+    FlashAttention = None
     FLASH_IS_AVAILABLE = False
     print("flash attention is unavailable.")
+
+
+_logger = logging.getLogger(__name__)
 
 
 # feedforward
@@ -68,7 +73,8 @@ class LinearAttention(nn.Cell):
         q, k, v = ops.split(qkv, 1)
         q, k, v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
 
-        k = ops.softmax(k, axis=-1)
+        _k_dtype = k.dtype
+        k = ops.softmax(k.astype(ms.float32), axis=-1).astype(_k_dtype)
 
         # context = ops.einsum("bhdn,bhen->bhde", k, v)
         context = ops.BatchMatMul(transpose_b=True)(k, v)  # bhdn  # bhen  # bhde
@@ -83,14 +89,7 @@ class LinearAttention(nn.Cell):
 
 
 class MemoryEfficientCrossAttention(nn.Cell):
-    def __init__(
-        self,
-        query_dim,
-        context_dim=None,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-    ):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0, use_fa=False):
         super().__init__()
 
         assert FLASH_IS_AVAILABLE
@@ -108,6 +107,7 @@ class MemoryEfficientCrossAttention(nn.Cell):
         self.to_out = nn.SequentialCell(nn.Dense(inner_dim, query_dim), nn.Dropout(p=dropout))
 
         self.flash_attention = FlashAttention(head_dim=dim_head, head_num=heads, high_precision=True)
+        self.use_fa = use_fa
 
     def construct(self, x, context=None, mask=None, additional_tokens=None):
         h = self.heads
@@ -133,11 +133,12 @@ class MemoryEfficientCrossAttention(nn.Cell):
         v_b, v_n, _ = v.shape
         v = v.view(v_b, v_n, h, -1).transpose(0, 2, 1, 3)
 
-        head_dim = q.shape[-1]
-        if q_n % 16 == 0 and k_n % 16 == 0 and head_dim <= 256:
+        if self.use_fa:
             if mask is None:
                 mask = ops.zeros((q_b, q_n, q_n), ms.uint8)
-            out = self.flash_attention(q.to(ms.float16), k.to(ms.float16), v.to(ms.float16), mask.to(ms.uint8))
+            out = self.flash_attention(
+                q.to(ms.float16), k.to(ms.float16), v.to(ms.float16), mask[:, None, :, :].to(ms.uint8)
+            )
         else:
             out = scaled_dot_product_attention(q, k, v, attn_mask=mask)  # scale is dim_head ** -0.5 per default
 
@@ -155,14 +156,7 @@ class MemoryEfficientCrossAttention(nn.Cell):
 
 
 class CrossAttention(nn.Cell):
-    def __init__(
-        self,
-        query_dim,
-        context_dim=None,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-    ):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0, use_fa=False):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -247,14 +241,11 @@ class BasicTransformerBlock(nn.Cell):
             dim_head=d_head,
             dropout=dropout,
             context_dim=context_dim if self.disable_self_attn else None,
+            use_fa=True,
         )  # is a self-attention if not self.disable_self_attn
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.attn2 = attn_cls(
-            query_dim=dim,
-            context_dim=context_dim,
-            heads=n_heads,
-            dim_head=d_head,
-            dropout=dropout,
+            query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout, use_fa=False
         )  # is self-attn if context is none
         self.norm1 = nn.LayerNorm([dim], epsilon=1e-5)
         self.norm2 = nn.LayerNorm([dim], epsilon=1e-5)
@@ -291,7 +282,9 @@ class SpatialTransformer(nn.Cell):
         attn_type: Literal["vanilla", "flash-attention"] = "vanilla",
     ):
         super().__init__()
-        print(f"constructing {self.__class__.__name__} of depth {depth} w/ {in_channels} channels and {n_heads} heads")
+        _logger.debug(
+            f"constructing {self.__class__.__name__} of depth {depth} w/ {in_channels} channels and {n_heads} heads"
+        )
         from omegaconf import ListConfig
 
         if exists(context_dim) and not isinstance(context_dim, (list, ListConfig)):
@@ -343,7 +336,6 @@ class SpatialTransformer(nn.Cell):
             self.proj_out = zero_module(nn.Dense(inner_dim, in_channels))
         self.use_linear = use_linear
 
-    @trace
     def construct(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, (list, tuple)):
