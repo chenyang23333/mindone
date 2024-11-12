@@ -205,7 +205,7 @@ if __name__ == "__main__":
 
     # 2. vae model initiate and weight loading
     print_banner("vae init")
-    vae = CausalVAEModelWrapper(args.ae_path, cache_dir=args.cache_dir, use_safetensors=True)
+    vae = CausalVAEModelWrapper(args.ae_path, cache_dir=args.cache_dir, use_safetensors=True) #封装
     if args.enable_tiling:
         vae.vae.enable_tiling()
         vae.vae.tile_overlap_factor = args.tile_overlap_factor
