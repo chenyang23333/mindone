@@ -6,6 +6,7 @@ import math
 import os
 import random
 import time
+from functools import partial
 from itertools import islice
 
 import numpy as np
@@ -260,10 +261,13 @@ def get_device_rank_info():
     return rank_id, device_num
 
 
-def split_by_node(src, group=None):
-    # rank, world_size, worker, num_workers = utils.pytorch_worker_info(group=group)
+def split_by_node(src, group=None, rank_id=None, rank_size=None):
     assert group is None, "currently only support group is None"
     rank, world_size = get_device_rank_info()
+    if rank_id is not None:
+        rank = rank_id
+    if rank_size is not None:
+        world_size = rank_size
 
     if world_size > 1:
         yield from islice(src, rank, None, world_size)
@@ -287,13 +291,14 @@ def get_num_samples(shardlist_desc=None, data_path=None):
     if shardlist_desc is None:
         assert data_path is not None
         if not os.path.exists(os.path.join(data_path, "data_info.json")):
-            print("Scanning tar files to get sample nums...")
-            # TODO: only scan tar files whose url/name is not in the shardlist description
-            shardlist_desc = generate_sharlist(data_path)
-            print("=> Saved shardlist json file in ", shardlist_desc)
+            shardlist_desc_file = os.path.join(data_path, "data_info.json")
+            raise FileNotFoundError(
+                f"{shardlist_desc_file} not found, please prepare dataset meta info before training, "
+                f"generate through `tools/data_check/get_wds_num_samples.py`"
+            )
         else:
             shardlist_desc = os.path.join(data_path, "data_info.json")
-    print("Loading sharlist description from: ", shardlist_desc)
+    print("Loading sharlist description from: ", shardlist_desc, flush=True)
 
     tot_samples = 0
     with open(shardlist_desc, "r") as fp:
@@ -332,10 +337,21 @@ class T2I_Webdataset(T2I_BaseDataset):
             f"rank id {rank_id}, num samples per device: {samples_per_rank}"
         )
 
+        if device_num > len(tar_files):
+            print(
+                f"WARNING: RankSize {device_num} greater than WebDataset tar files num {len(tar_files)}, "
+                f"tar files will be sampled repeatedly.",
+            )
+            device_num = len(tar_files)
+            rank_id %= device_num
+
         # webdataset with shard split
         # self.wds_iterator = wds.WebDataset(tar_files, resampled=True, cache_dir=cache_dir, nodesplitter=split_by_node)
         self.wds_iterator = wds.WebDataset(
-            tar_files, cache_dir=None, nodesplitter=split_by_node, workersplitter=split_by_worker
+            tar_files,
+            cache_dir=None,
+            nodesplitter=partial(split_by_node, rank_id=rank_id, rank_size=device_num),
+            workersplitter=split_by_worker,
         )
         self.wds_iterator = self.wds_iterator.with_epoch(samples_per_rank)
         self.num_samples = samples_per_rank
@@ -358,7 +374,7 @@ class T2I_Webdataset(T2I_BaseDataset):
                 if sample is not None:
                     self.prev_ok_sample = copy.deepcopy(sample)
                     break
-                assert trials > max_attempts, f"Cannot get normal samples in {max_attempts} attempts"
+                assert trials < max_attempts, f"Cannot get normal samples in {max_attempts} attempts"
             except StopIteration:
                 raise StopIteration
             except Exception as e:
@@ -395,6 +411,23 @@ class T2I_Webdataset(T2I_BaseDataset):
             except StopIteration:
                 raise StopIteration
             except Exception as e:
+                # Print damaged samples
+                caption = None
+                try:
+                    if "json" in raw and self.caption_key:
+                        annot = json.load(io.BytesIO(raw["json"]))
+                        if self.caption_key in annot:
+                            caption = annot[self.caption_key]
+                        else:
+                            raise ValueError(f"No caption found. Expecting caption key: {self.caption_key}")
+                except Exception:
+                    pass
+                if caption:
+                    print(f"\tDamaged samples, caption: {caption}, raw data: {raw}")
+                else:
+                    print(f"\tDamaged samples, load caption fail, raw data: {raw}")
+                ####################
+
                 print(
                     "=> WARNING: Fail to get the iterated sample. The sample can be corrupted and will be replaced by previous normal sample."
                 )

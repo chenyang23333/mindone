@@ -34,10 +34,10 @@ class DDPMSchedulerOutput(BaseOutput):
     Output class for the scheduler's `step` function output.
 
     Args:
-        prev_sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)` for images):
+        prev_sample (`ms.Tensor` of shape `(batch_size, num_channels, height, width)` for images):
             Computed sample `(x_{t-1})` of previous timestep. `prev_sample` should be used as next model input in the
             denoising loop.
-        pred_original_sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)` for images):
+        pred_original_sample (`ms.Tensor` of shape `(batch_size, num_channels, height, width)` for images):
             The predicted denoised sample `(x_{0})` based on the model output from the current timestep.
             `pred_original_sample` can be used to preview progress or for guidance.
     """
@@ -80,7 +80,7 @@ def betas_for_alpha_bar(
             return math.exp(t * -12.0)
 
     else:
-        raise ValueError(f"Unsupported alpha_tranform_type: {alpha_transform_type}")
+        raise ValueError(f"Unsupported alpha_transform_type: {alpha_transform_type}")
 
     betas = []
     for i in range(num_diffusion_timesteps):
@@ -109,8 +109,8 @@ def rescale_zero_terminal_snr(betas):
     alphas_bar_sqrt = alphas_cumprod.sqrt()
 
     # Store old values.
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].copy()
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].copy()
 
     # Shift so the last timestep is zero.
     alphas_bar_sqrt -= alphas_bar_sqrt_T
@@ -198,7 +198,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         rescale_betas_zero_snr: int = False,
     ):
         if trained_betas is not None:
-            self.betas = ms.Tensor(trained_betas, dtype=ms.float32)
+            self.betas = ms.tensor(trained_betas, dtype=ms.float32)
         elif beta_schedule == "linear":
             self.betas = ms.tensor(np.linspace(beta_start, beta_end, num_train_timesteps), dtype=ms.float32)
         elif beta_schedule == "scaled_linear":
@@ -214,7 +214,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             betas = ms.tensor(np.linspace(-6, 6, num_train_timesteps), dtype=ms.float32)
             self.betas = ops.sigmoid(betas) * (beta_end - beta_start) + beta_start
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
+            raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
         # Rescale for zero SNR
         if rescale_betas_zero_snr:
@@ -380,11 +380,11 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
             sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
 
         # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims).item())
 
         abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
 
-        s = ops.quantile(abs_sample, self.config.dynamic_thresholding_ratio, axis=1)
+        s = ms.Tensor.from_numpy(np.quantile(abs_sample.asnumpy(), self.config.dynamic_thresholding_ratio, axis=1))
         s = ops.clamp(
             s, min=1, max=self.config.sample_max_value
         )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
@@ -427,6 +427,7 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
 
         """
         t = timestep
+        dtype = sample.dtype
 
         prev_t = self.previous_timestep(t)
 
@@ -446,11 +447,15 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
         # 2. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
         if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_original_sample = (
+                (sample - (beta_prod_t ** (0.5) * model_output).to(dtype)) / alpha_prod_t ** (0.5)
+            ).to(dtype)
         elif self.config.prediction_type == "sample":
             pred_original_sample = model_output
         elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+            pred_original_sample = (alpha_prod_t**0.5).to(dtype) * sample - (beta_prod_t**0.5).to(
+                dtype
+            ) * model_output
         else:
             raise ValueError(
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
@@ -472,19 +477,23 @@ class DDPMScheduler(SchedulerMixin, ConfigMixin):
 
         # 5. Compute predicted previous sample µ_t
         # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
-        pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * sample
+        pred_prev_sample = (
+            pred_original_sample_coeff.to(dtype) * pred_original_sample + current_sample_coeff.to(dtype) * sample
+        )
 
         # 6. Add noise
         variance = 0
         if t > 0:
             variance_noise = randn_tensor(model_output.shape, generator=generator, dtype=model_output.dtype)
             if self.variance_type == "fixed_small_log":
-                variance = self._get_variance(t, predicted_variance=predicted_variance) * variance_noise
+                variance = self._get_variance(t, predicted_variance=predicted_variance).to(dtype) * variance_noise
             elif self.variance_type == "learned_range":
                 variance = self._get_variance(t, predicted_variance=predicted_variance)
-                variance = ops.exp(0.5 * variance) * variance_noise
+                variance = ops.exp(0.5 * variance).to(dtype) * variance_noise
             else:
-                variance = (self._get_variance(t, predicted_variance=predicted_variance) ** 0.5) * variance_noise
+                variance = (self._get_variance(t, predicted_variance=predicted_variance) ** 0.5).to(
+                    dtype
+                ) * variance_noise
 
         pred_prev_sample = pred_prev_sample + variance
 

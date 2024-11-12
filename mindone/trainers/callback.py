@@ -9,9 +9,9 @@ from mindspore.train.callback._callback import Callback, _handle_loss
 from .checkpoint import CheckpointManager
 from .recorder import PerfRecorder
 
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger("")
 
-__all__ = ["OverflowMonitor", "EvalSaveCallback", "ProfilerCallback"]
+__all__ = ["OverflowMonitor", "EvalSaveCallback", "ProfilerCallback", "StopAtStepCallback"]
 
 
 class OverflowMonitor(ms.Callback):
@@ -34,6 +34,7 @@ class EvalSaveCallback(Callback):
         ckpt_save_dir="./",
         output_dir=None,
         ema=None,
+        save_ema_only=True,
         ckpt_save_policy="lastest_k",
         ckpt_max_keep=10,
         step_mode=False,
@@ -47,12 +48,17 @@ class EvalSaveCallback(Callback):
         model_name="sd",
         save_trainable_only: bool = False,
         param_save_filter: List[str] = None,
+        resume_prefix_blacklist: List[str] = None,
+        integrated_save=False,
+        save_training_resume=True,
+        train_steps=-1,
     ):
         """
         Args:
             step_mode: if True, ckpt_save_interval is counted in steps. otherwise, in epochs.
             param_save_filter: indicates what parameters to save in checkpoint. If None, save all parameters in network. \
                 Otherwise, only params that contain one of the keyword in param_save_filter list will be saved.
+            resume_prefix_blacklist: exclude parameters with one of these prefixes to be saved in resume checkpoint. e.g. ['swap.', 'vae.'].
         """
         self.rank_id = rank_id
         self.is_main_device = rank_id in [0, None]
@@ -75,6 +81,7 @@ class EvalSaveCallback(Callback):
         self.log_interval = log_interval
         self.start_epoch = start_epoch
         self.record_lr = record_lr
+        self.save_ema_only = save_ema_only
 
         if self.is_main_device:
             self.ckpt_save_policy = ckpt_save_policy
@@ -82,6 +89,7 @@ class EvalSaveCallback(Callback):
                 ckpt_save_dir,
                 ckpt_save_policy,
                 k=ckpt_max_keep,
+                integrated_save=integrated_save,
             )
             if self.start_epoch == 0:
                 if self.record_lr:
@@ -111,12 +119,29 @@ class EvalSaveCallback(Callback):
         self.use_lora = use_lora
 
         self.use_step_unit = use_step_unit
+        self.train_steps = train_steps
+        self.save_training_resume = save_training_resume
+        if resume_prefix_blacklist is not None:
+
+            def choice_func(x):
+                for prefix in resume_prefix_blacklist:
+                    if x.startswith("vae."):
+                        return False
+                return True
+
+            self.choice_func = choice_func
+        else:
+            self.choice_func = None
 
     def on_train_step_end(self, run_context):
         cb_params = run_context.original_args()
         loss = _handle_loss(cb_params.net_outputs)
-        cur_step = cb_params.cur_step_num + self.start_epoch * cb_params.batch_num
-        step_num = cb_params.batch_num * cb_params.epoch_num
+        opt = self._get_optimizer_from_cbp(cb_params)
+        cur_step = int(opt.global_step.asnumpy().item())
+        if cur_step <= 0:
+            cur_step = cb_params.cur_step_num + self.start_epoch * cb_params.batch_num
+
+        step_num = (cb_params.batch_num * cb_params.epoch_num) if self.train_steps < 0 else self.train_steps
 
         if cur_step % cb_params.batch_num == 0:
             cur_epoch = cb_params.cur_epoch_num
@@ -131,24 +156,34 @@ class EvalSaveCallback(Callback):
                     if self.use_step_unit
                     else f"{self.model_name}-e{cur_epoch}.ckpt"
                 )
+
+                append_dict = {"lora_rank": self.lora_rank} if self.use_lora else None
                 if self.ema is not None:
+                    if not self.save_ema_only:
+                        self.ckpt_manager.save(
+                            self.net_to_save,
+                            None,
+                            ckpt_name=ckpt_name.replace(".ckpt", "_nonema.ckpt"),
+                            append_dict=append_dict,
+                        )
                     # swap ema weight and network weight
                     self.ema.swap_before_eval()
 
                 # save history checkpoints
-                append_dict = {"lora_rank": self.lora_rank} if self.use_lora else None
                 self.ckpt_manager.save(self.net_to_save, None, ckpt_name=ckpt_name, append_dict=append_dict)
 
-                # TODO: resume training for step.
-                ms.save_checkpoint(
-                    cb_params.train_network,
-                    os.path.join(self.ckpt_save_dir, "train_resume.ckpt"),
-                    append_dict={
-                        "epoch_num": cur_epoch,
-                        "cur_step": cur_step,
-                        "loss_scale": self._get_scaling_value_from_cbp(cb_params),
-                    },
-                )
+                if self.save_training_resume:
+                    # TODO: resume training for step.
+                    ms.save_checkpoint(
+                        cb_params.train_network,
+                        os.path.join(self.ckpt_save_dir, "train_resume.ckpt"),
+                        choice_func=self.choice_func,
+                        append_dict={
+                            "epoch_num": cur_epoch,
+                            "cur_step": cur_step,
+                            "loss_scale": self._get_scaling_value_from_cbp(cb_params),
+                        },
+                    )
 
                 # swap back network weight and ema weight. MUST execute after model saving and before next-step training
                 if self.ema is not None:
@@ -164,24 +199,29 @@ class EvalSaveCallback(Callback):
                 )
                 self.rec.add(*step_pref_value)
 
-                self.step_start_time = time.time()
                 if self.record_lr:
                     _logger.info(
-                        "epoch: %d step: %d, lr: %.7f, loss: %.6f, loss scale: %d.",
+                        "epoch %d, step %d, lr %.7f, loss %.6f, loss scale %d, global_step %d, step_time(ms) %.1f",
                         cb_params.cur_epoch_num,
                         (cb_params.cur_step_num - 1) % cb_params.batch_num + 1,
                         cur_lr.asnumpy().item(),
                         loss.asnumpy().item(),
                         self._get_scaling_value_from_cbp(cb_params),
+                        cur_step,
+                        (train_time * 1000) / self.log_interval,
                     )
                 else:
                     _logger.info(
-                        "epoch: %d step: %d, loss: %.6f, loss scale: %d.",
+                        "epoch %d, step %d, loss %.6f, loss scale %d, global_step %d, step_time(ms) %.1f",
                         cb_params.cur_epoch_num,
                         (cb_params.cur_step_num - 1) % cb_params.batch_num + 1,
                         loss.asnumpy().item(),
                         self._get_scaling_value_from_cbp(cb_params),
+                        cur_step,
+                        (train_time * 1000) / self.log_interval,
                     )
+
+                self.step_start_time = time.time()
 
     def on_train_epoch_begin(self, run_context):
         """
@@ -202,7 +242,9 @@ class EvalSaveCallback(Callback):
         cur_epoch = cb_params.cur_epoch_num
         epoch_num = cb_params.epoch_num
 
-        cur_step = cur_epoch * cb_params.batch_num
+        # cur_step = cur_epoch * cb_params.batch_num
+        opt = self._get_optimizer_from_cbp(cb_params)
+        cur_step = int(opt.global_step.asnumpy().item())
 
         if self.is_main_device and (not self.step_mode):
             if (cur_epoch % self.ckpt_save_interval == 0) or (cur_epoch == epoch_num):
@@ -211,22 +253,32 @@ class EvalSaveCallback(Callback):
                     if self.use_step_unit
                     else f"{self.model_name}-e{cur_epoch}.ckpt"
                 )
+
+                append_dict = {"lora_rank": self.lora_rank} if self.use_lora else None
                 if self.ema is not None:
+                    if not self.save_ema_only:
+                        self.ckpt_manager.save(
+                            self.net_to_save,
+                            None,
+                            ckpt_name=ckpt_name.replace(".ckpt", "_nonema.ckpt"),
+                            append_dict=append_dict,
+                        )
                     # swap ema weight and network weight
                     self.ema.swap_before_eval()
 
                 # save history checkpoints
-                append_dict = {"lora_rank": self.lora_rank} if self.use_lora else None
                 self.ckpt_manager.save(self.net_to_save, None, ckpt_name=ckpt_name, append_dict=append_dict)
 
-                ms.save_checkpoint(
-                    cb_params.train_network,
-                    os.path.join(self.ckpt_save_dir, "train_resume.ckpt"),
-                    append_dict={
-                        "epoch_num": cur_epoch,
-                        "loss_scale": self._get_scaling_value_from_cbp(cb_params),
-                    },
-                )
+                if self.save_training_resume:
+                    ms.save_checkpoint(
+                        cb_params.train_network,
+                        os.path.join(self.ckpt_save_dir, "train_resume.ckpt"),
+                        choice_func=self.choice_func,
+                        append_dict={
+                            "epoch_num": cur_epoch,
+                            "loss_scale": self._get_scaling_value_from_cbp(cb_params),
+                        },
+                    )
 
                 # swap back network weight and ema weight. MUST execute after model saving and before next-step training
                 if self.ema is not None:
@@ -240,6 +292,14 @@ class EvalSaveCallback(Callback):
                 log_str = f"Top K checkpoints:\n{self.main_indicator}\tcheckpoint\n"
                 for p, ckpt_name in self.ckpt_manager.get_ckpt_queue():
                     log_str += f"{p:.4f}\t{os.path.join(self.ckpt_save_dir, ckpt_name)}\n"
+
+    def on_eval_end(self, run_context):
+        if self.is_main_device:
+            cb_params = run_context.original_args()
+            metrics = cb_params.get("metrics")
+            if metrics is not None:
+                metrics = {k: f"{v:.4f}" for k, v in metrics.items()}
+                _logger.info(f"Eval result epoch {cb_params.cur_epoch_num}: {metrics}")
 
     def _get_optimizer_from_cbp(self, cb_params):
         if cb_params.optimizer is not None:
@@ -262,6 +322,18 @@ class EvalSaveCallback(Callback):
         if opt.dynamic_lr:
             lr = opt.learning_rate(opt.global_step - 1)[0]
         return lr
+
+
+class StopAtStepCallback(ms.Callback):
+    # stop the training process when reach train_steps
+    def __init__(self, train_steps, global_step=0):
+        self.global_step = global_step
+        self.train_steps = train_steps
+
+    def on_train_step_end(self, run_context):
+        self.global_step += 1
+        if self.global_step >= self.train_steps:
+            run_context.request_stop()
 
 
 class ProfilerCallback(ms.Callback):
@@ -287,3 +359,24 @@ class ProfilerCallback(ms.Callback):
             _logger.info(f"finish analyzing profiler in step range [{self.start_step}, {self.end_step}]")
             if self.exit_after_analyze:
                 run_context.request_stop()
+
+
+class ProfilerCallbackEpoch(ms.Callback):
+    def __init__(self, start_epoch, stop_epoch, output_dir="./profiler_data"):
+        super().__init__()
+        self.start_epoch = start_epoch
+        self.stop_epoch = stop_epoch
+        self.profiler = ms.Profiler(start_profile=False, output_path=output_dir)
+
+    def on_train_epoch_begin(self, run_context):
+        cb_params = run_context.original_args()
+        epoch_num = cb_params.cur_epoch_num
+        if epoch_num == self.start_epoch:
+            self.profiler.start()
+
+    def on_train_epoch_end(self, run_context):
+        cb_params = run_context.original_args()
+        epoch_num = cb_params.cur_epoch_num
+        if epoch_num == self.stop_epoch:
+            self.profiler.stop()
+            self.profiler.analyse()

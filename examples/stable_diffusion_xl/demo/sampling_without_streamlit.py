@@ -13,6 +13,9 @@ sys.path.append("..")
 if os.environ.get("MS_PYNATIVE_GE") != "1":
     os.environ["MS_PYNATIVE_GE"] = "1"
 
+mindone_lib_path = os.path.abspath(os.path.abspath("../../"))
+sys.path.insert(0, mindone_lib_path)
+
 from cldm.util import get_control
 from gm.helpers import (
     SD_XL_BASE_RATIOS,
@@ -97,7 +100,6 @@ def get_parser_sample():
         default=1.0,
         help="For DynamicThresholding. Valid only when thresholding=True.",
     )
-
     parser.add_argument(
         "--discretization",
         type=str,
@@ -128,11 +130,19 @@ def get_parser_sample():
     parser.add_argument("--num_rows", type=int, default=1)
     parser.add_argument("--num_cols", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", type=ast.literal_eval, default=True)
     parser.add_argument(
         "--init_latent_path",
         type=str,
         default=None,
         help="path to initial latent noise (npy file). If not None, seed will not make effect and the initial latent noise will be used for sampling.",
+    )
+    parser.add_argument(
+        "--init_noise_scheduler_path",
+        type=str,
+        default=None,
+        help="path to initial sampler noise (npy file). If not None, seed will not make effect and the initial noise will be used "
+        "for sampling. Currently only supported in the EulerA sampler.",
     )
     parser.add_argument("--precision_keep_origin_dtype", type=ast.literal_eval, default=False)
     parser.add_argument("--save_path", type=str, default="outputs/demo/", help="save dir")
@@ -207,7 +217,6 @@ def run_txt2img(
     C = version_dict["C"]
     F = version_dict["f"]
 
-    prompts = []
     if os.path.exists(args.prompt):
         with open(args.prompt, "r") as f:
             prompts = f.read().splitlines()
@@ -254,7 +263,7 @@ def run_txt2img(
         images = []
         for j in range(num_samples):
             np.random.seed(args.seed + j)  # set seed for every sample
-            print(f"[{i+1}/{len(prompts)}]: sampling prompt: ", value_dict["prompt"], f"({j+1}/{num_samples})")
+            print(f"[{i + 1}/{len(prompts)}]: sampling prompt: ", prompt, f"({j + 1}/{num_samples})")
             value_dict["prompt"] = prompt
             s_time = time.time()
             sampling_func = partial(do_sample_long_prompts, model) if args.support_long_prompts else model.do_sample
@@ -271,6 +280,7 @@ def run_txt2img(
                 filter=filter,
                 amp_level=amp_level,
                 init_latent_path=args.init_latent_path,
+                init_noise_scheduler_path=args.init_noise_scheduler_path,
                 control=control,
             )
             print(f"Txt2Img sample step {sampler.num_steps}, time cost: {time.time() - s_time:.2f}s")
@@ -532,6 +542,14 @@ if __name__ == "__main__":
         mode=args.ms_mode,
         device_target=args.device_target,
     )
+    if args.deterministic:
+        # get same results for each run
+        ms.context.set_context(deterministic="ON")
+
+        # FIXME: Bug on MindSpore 2.2.11, If not setting `pynative_synchronize=True`, there may be a relatively small
+        #  probability(~1%) of the result not meeting expectations.
+        ms.context.set_context(pynative_synchronize=True)
+
     if args.precision_keep_origin_dtype:
         ms.context.set_context(ascend_config=dict(precision_mode="must_keep_origin_dtype"))
 

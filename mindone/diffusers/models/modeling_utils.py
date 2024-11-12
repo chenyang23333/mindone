@@ -1,6 +1,6 @@
 # coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team.
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright 2024 The HuggingFace Inc. team.
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
+import json
 import os
+import re
 from collections import OrderedDict
 from functools import partial
-from typing import Any, Callable, List, Optional, Union
+from pathlib import Path
+from typing import Any, Callable, Optional, Union
 
 from huggingface_hub import create_repo
 from huggingface_hub.utils import validate_hf_hub_args
@@ -24,68 +28,42 @@ from huggingface_hub.utils import validate_hf_hub_args
 import mindspore as ms
 from mindspore import nn, ops
 
-from mindone.safetensors.mindspore import load_file as safe_load_file
 from mindone.safetensors.mindspore import save_file as safe_save_file
 
 from .. import __version__
 from ..utils import (
     CONFIG_NAME,
-    SAFETENSORS_FILE_EXTENSION,
+    SAFE_WEIGHTS_INDEX_NAME,
     SAFETENSORS_WEIGHTS_NAME,
+    WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
     _add_variant,
+    _get_checkpoint_shard_files,
     _get_model_file,
     deprecate,
     logging,
 )
 from ..utils.hub_utils import PushToHubMixin, load_or_create_model_card, populate_model_card
+from .model_loading_utils import (
+    _fetch_index_file,
+    _load_state_dict_into_model,
+    load_checkpoint_and_dispatch,
+    load_state_dict,
+    split_torch_state_dict_into_shards,
+)
 
 logger = logging.get_logger(__name__)
 
-
-def get_parameter_dtype(module: nn.Cell) -> ms.Type:
-    params = tuple(module.get_parameters())
-    if len(params) > 0:
-        return params[0].dtype
-
-
-def load_state_dict(checkpoint_file: Union[str, os.PathLike], variant: Optional[str] = None):
-    """
-    Reads a checkpoint file, returning properly formatted errors if they arise.
-    """
-    try:
-        file_extension = os.path.basename(checkpoint_file).split(".")[-1]
-        if file_extension == SAFETENSORS_FILE_EXTENSION:
-            return safe_load_file(checkpoint_file)
-        else:
-            raise NotImplementedError(
-                f"Only supports deserialization of weights file in safetensors format, but got {checkpoint_file}"
-            )
-    except Exception as e:
-        try:
-            with open(checkpoint_file) as f:
-                if f.read().startswith("version"):
-                    raise OSError(
-                        "You seem to have cloned a repository without having git-lfs installed. Please install "
-                        "git-lfs and run `git lfs install` followed by `git lfs pull` in the folder "
-                        "you cloned."
-                    )
-                else:
-                    raise ValueError(
-                        f"Unable to locate the file {checkpoint_file} which is necessary to load this pretrained "
-                        "model. Make sure you have saved the model properly."
-                    ) from e
-        except (UnicodeDecodeError, ValueError):
-            raise OSError(
-                f"Unable to load weights from checkpoint file for '{checkpoint_file}' " f"at '{checkpoint_file}'. "
-            )
+_REGEX_SHARD = re.compile(r"(.*?)-\d{5}-of-\d{5}")
 
 
 def _get_pt2ms_mappings(m):
     mappings = {}  # pt_param_name: (ms_param_name, pt_param_to_ms_param_func)
     for name, cell in m.cells_and_names():
-        if isinstance(cell, nn.Conv1d):
-            mappings[f"{name}.weight"] = f"{name}.weight", lambda x: ops.expand_dims(x, axis=-2)
+        if isinstance(cell, (nn.Conv1d, nn.Conv1dTranspose)):
+            mappings[f"{name}.weight"] = f"{name}.weight", lambda x: ms.Parameter(
+                ops.expand_dims(x, axis=-2), name=x.name
+            )
         elif isinstance(cell, nn.Embedding):
             mappings[f"{name}.weight"] = f"{name}.embedding_table", lambda x: x
         elif isinstance(cell, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
@@ -99,25 +77,23 @@ def _get_pt2ms_mappings(m):
 
 
 def _convert_state_dict(m, state_dict_pt):
-    mappings = _get_pt2ms_mappings(m)
+    if not state_dict_pt:
+        return state_dict_pt
+    pt2ms_mappings = _get_pt2ms_mappings(m)
     state_dict_ms = {}
-    for name_pt, data_pt in state_dict_pt.items():
-        name_ms, data_mapping = mappings.get(name_pt, (name_pt, lambda x: x))
+    while state_dict_pt:
+        name_pt, data_pt = state_dict_pt.popitem()
+        name_ms, data_mapping = pt2ms_mappings.get(name_pt, (name_pt, lambda x: x))
         data_ms = data_mapping(data_pt)
         if name_ms is not None:
             state_dict_ms[name_ms] = data_ms
     return state_dict_ms
 
 
-def _load_state_dict_into_model(model_to_load, state_dict: OrderedDict) -> List[str]:
-    error_msgs = []
-    param_not_load, ckpt_not_load = ms.load_param_into_net(model_to_load, state_dict, strict_load=True)
-    if param_not_load:
-        error_msgs.append(f"{param_not_load} in network is not loaded!")
-    if ckpt_not_load:
-        error_msgs.append(f"{ckpt_not_load} in checkpoint is not loaded!")
-
-    return error_msgs
+def get_parameter_dtype(module: nn.Cell) -> ms.Type:
+    params = tuple(module.get_parameters())
+    if len(params) > 0:
+        return params[0].dtype
 
 
 class ModelMixin(nn.Cell, PushToHubMixin):
@@ -134,6 +110,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
     _automatically_saved_args = ["_diffusers_version", "_class_name", "_name_or_path"]
     _supports_gradient_checkpointing = False
     _keys_to_ignore_on_load_unexpected = None
+    _no_split_modules = None
 
     def __init__(self):
         super().__init__()
@@ -161,7 +138,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
         """
         Whether gradient checkpointing is activated for this model or not.
         """
-        return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
+        return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for _, m in self.cells_and_names())
 
     def enable_gradient_checkpointing(self) -> None:
         """
@@ -181,13 +158,57 @@ class ModelMixin(nn.Cell, PushToHubMixin):
             self.apply(partial(self._set_gradient_checkpointing, value=False))
 
     def set_use_memory_efficient_attention_xformers(self, valid: bool, attention_op: Optional[Callable] = None) -> None:
-        raise NotImplementedError
+        # Recursively walk through all the children.
+        # Any children which exposes the set_use_memory_efficient_attention_xformers method
+        # gets the message
+        def fn_recursive_set_mem_eff(module: nn.Cell):
+            if hasattr(module, "set_use_memory_efficient_attention_xformers"):
+                module.set_use_memory_efficient_attention_xformers(valid, attention_op)
+
+            for child in module.cells():
+                fn_recursive_set_mem_eff(child)
+
+        for module in self.cells():
+            if isinstance(module, nn.Cell):
+                fn_recursive_set_mem_eff(module)
 
     def enable_xformers_memory_efficient_attention(self, attention_op: Optional[Callable] = None) -> None:
-        raise NotImplementedError
+        r"""
+        Enable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
+
+        When this option is enabled, you should observe lower GPU memory usage and a potential speed up during
+        inference. Speed up during training is not guaranteed.
+
+        <Tip warning={true}>
+
+        ⚠️ When memory efficient attention and sliced attention are both enabled, memory efficient attention takes
+        precedent.
+
+        </Tip>
+
+        Parameters:
+            attention_op (`Callable`, *optional*):
+                Not supported for now.
+
+        Examples:
+
+        ```py
+        >>> import mindspore as ms
+        >>> from mindone.diffusers import UNet2DConditionModel
+
+        >>> model = UNet2DConditionModel.from_pretrained(
+        ...     "stabilityai/stable-diffusion-2-1", subfolder="unet", mindspore_dtype=ms.float16
+        ... )
+        >>> model.enable_xformers_memory_efficient_attention()
+        ```
+        """
+        self.set_use_memory_efficient_attention_xformers(True, attention_op)
 
     def disable_xformers_memory_efficient_attention(self) -> None:
-        raise NotImplementedError
+        r"""
+        Disable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
+        """
+        self.set_use_memory_efficient_attention_xformers(False)
 
     def save_pretrained(
         self,
@@ -196,6 +217,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
         save_function: Optional[Callable] = None,
         safe_serialization: bool = True,
         variant: Optional[str] = None,
+        max_shard_size: Union[int, str] = "10GB",
         push_to_hub: bool = False,
         **kwargs,
     ):
@@ -212,12 +234,19 @@ class ModelMixin(nn.Cell, PushToHubMixin):
                 process to avoid race conditions.
             save_function (`Callable`):
                 The function to use to save the state dictionary. Useful during distributed training when you need to
-                replace `torch.save` with another method. Can be configured with the environment variable
+                replace `mindspore.save_checkpoint` with another method. Can be configured with the environment variable
                 `DIFFUSERS_SAVE_MODE`.
             safe_serialization (`bool`, *optional*, defaults to `True`):
                 Whether to save the model using `safetensors` or the traditional PyTorch way with `pickle`.
             variant (`str`, *optional*):
                 If specified, weights are saved in the format `pytorch_model.<variant>.bin`.
+            max_shard_size (`int` or `str`, defaults to `"10GB"`):
+                The maximum size for a checkpoint before being sharded. Checkpoints shard will then be each of size
+                lower than this size. If expressed as a string, needs to be digits followed by a unit (like `"5GB"`).
+                If expressed as an integer, the unit is bytes. Note that this limit will be decreased after a certain
+                period of time (starting from Oct 2024) to allow users to upgrade to the latest version of `diffusers`.
+                This is to establish a common default size for this argument across different libraries in the Hugging
+                Face ecosystem (`transformers`, and `accelerate`, for example).
             push_to_hub (`bool`, *optional*, defaults to `False`):
                 Whether or not to push your model to the Hugging Face Hub after saving it. You can specify the
                 repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
@@ -228,6 +257,14 @@ class ModelMixin(nn.Cell, PushToHubMixin):
         if os.path.isfile(save_directory):
             logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
             return
+
+        weights_name = SAFETENSORS_WEIGHTS_NAME if safe_serialization else WEIGHTS_NAME
+        weights_name = _add_variant(weights_name, variant)
+        weight_name_split = weights_name.split(".")
+        if len(weight_name_split) in [2, 3]:
+            weights_name_pattern = weight_name_split[0] + "{suffix}." + ".".join(weight_name_split[1:])
+        else:
+            raise ValueError(f"Invalid {weights_name} provided.")
 
         os.makedirs(save_directory, exist_ok=True)
 
@@ -248,24 +285,66 @@ class ModelMixin(nn.Cell, PushToHubMixin):
             model_to_save.save_config(save_directory)
 
         # Save the model
-        state_dict = model_to_save.parameters_dict()
-
-        weights_name = SAFETENSORS_WEIGHTS_NAME if safe_serialization else WEIGHTS_NAME
-        weights_name = _add_variant(weights_name, variant)
+        state_dict = {k: v for k, v in model_to_save.parameters_and_names()}
 
         # Save the model
-        if safe_serialization:
-            safe_save_file(state_dict, os.path.join(save_directory, weights_name), metadata={"format": "np"})
-        else:
-            ms.save_checkpoint(state_dict, os.path.join(save_directory, weights_name))
+        state_dict_split = split_torch_state_dict_into_shards(
+            state_dict, max_shard_size=max_shard_size, filename_pattern=weights_name_pattern
+        )
 
-        logger.info(f"Model weights saved in {os.path.join(save_directory, weights_name)}")
+        # Clean the folder from a previous save
+        if is_main_process:
+            for filename in os.listdir(save_directory):
+                if filename in state_dict_split.filename_to_tensors.keys():
+                    continue
+                full_filename = os.path.join(save_directory, filename)
+                if not os.path.isfile(full_filename):
+                    continue
+                weights_without_ext = weights_name_pattern.replace(".bin", "").replace(".safetensors", "")
+                weights_without_ext = weights_without_ext.replace("{suffix}", "")
+                filename_without_ext = filename.replace(".bin", "").replace(".safetensors", "")
+                # make sure that file to be deleted matches format of sharded file, e.g. pytorch_model-00001-of-00005
+                if (
+                    filename.startswith(weights_without_ext)
+                    and _REGEX_SHARD.fullmatch(filename_without_ext) is not None
+                ):
+                    os.remove(full_filename)
+
+        for filename, tensors in state_dict_split.filename_to_tensors.items():
+            shard = {tensor: state_dict[tensor] for tensor in tensors}
+            filepath = os.path.join(save_directory, filename)
+            if safe_serialization:
+                # At some point we will need to deal better with save_function (used for TPU and other distributed
+                # joyfulness), but for now this enough.
+                safe_save_file(shard, filepath, metadata={"format": "np"})
+            else:
+                ms.save_checkpoint(shard, filepath)
+
+        if state_dict_split.is_sharded:
+            index = {
+                "metadata": state_dict_split.metadata,
+                "weight_map": state_dict_split.tensor_to_filename,
+            }
+            save_index_file = SAFE_WEIGHTS_INDEX_NAME if safe_serialization else WEIGHTS_INDEX_NAME
+            save_index_file = os.path.join(save_directory, _add_variant(save_index_file, variant))
+            # Save the index as well
+            with open(save_index_file, "w", encoding="utf-8") as f:
+                content = json.dumps(index, indent=2, sort_keys=True) + "\n"
+                f.write(content)
+            logger.info(
+                f"The model is bigger than the maximum size per checkpoint ({max_shard_size}) and is going to be "
+                f"split in {len(state_dict_split.filename_to_tensors)} checkpoint shards. You can find where each parameters has been saved in the "
+                f"index located at {save_index_file}."
+            )
+        else:
+            path_to_weights = os.path.join(save_directory, weights_name)
+            logger.info(f"Model weights saved in {path_to_weights}")
 
         if push_to_hub:
             # Create a new empty model card and eventually tag it
             model_card = load_or_create_model_card(repo_id, token=token)
             model_card = populate_model_card(model_card)
-            model_card.save(os.path.join(save_directory, "README.md"))
+            model_card.save(Path(save_directory, "README.md").as_posix())
 
             self._upload_folder(
                 save_directory,
@@ -302,9 +381,9 @@ class ModelMixin(nn.Cell, PushToHubMixin):
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            resume_download (`bool`, *optional*, defaults to `False`):
-                Whether or not to resume downloading the model weights and configuration files. If set to `False`, any
-                incompletely downloaded files are deleted.
+            resume_download:
+                Deprecated and ignored. All downloads are now resumed by default when possible. Will be removed in v1
+                of Diffusers.
             proxies (`Dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
@@ -319,6 +398,8 @@ class ModelMixin(nn.Cell, PushToHubMixin):
             revision (`str`, *optional*, defaults to `"main"`):
                 The specific model version to use. It can be a branch name, a tag name, a commit id, or any identifier
                 allowed by Git.
+            from_flax (`bool`, *optional*, defaults to `False`):
+                Load the model weights from a Flax checkpoint save file.
             subfolder (`str`, *optional*, defaults to `""`):
                 The subfolder location of a model file within a larger model repository on the Hub or locally.
             mirror (`str`, *optional*):
@@ -345,7 +426,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
         Example:
 
         ```py
-        from diffusers import UNet2DConditionModel
+        from mindone.diffusers import UNet2DConditionModel
 
         unet = UNet2DConditionModel.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="unet")
         ```
@@ -362,7 +443,8 @@ class ModelMixin(nn.Cell, PushToHubMixin):
         cache_dir = kwargs.pop("cache_dir", None)
         ignore_mismatched_sizes = kwargs.pop("ignore_mismatched_sizes", False)
         force_download = kwargs.pop("force_download", False)
-        resume_download = kwargs.pop("resume_download", False)
+        from_flax = kwargs.pop("from_flax", False)
+        resume_download = kwargs.pop("resume_download", None)
         proxies = kwargs.pop("proxies", None)
         output_loading_info = kwargs.pop("output_loading_info", False)
         local_files_only = kwargs.pop("local_files_only", None)
@@ -404,13 +486,76 @@ class ModelMixin(nn.Cell, PushToHubMixin):
             **kwargs,
         )
 
+        # Determine if we're loading from a directory of sharded checkpoints.
+        is_sharded = False
+        index_file = None
+        is_local = os.path.isdir(pretrained_model_name_or_path)
+        index_file = _fetch_index_file(
+            is_local=is_local,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            subfolder=subfolder or "",
+            use_safetensors=use_safetensors,
+            cache_dir=cache_dir,
+            variant=variant,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            user_agent=user_agent,
+            commit_hash=commit_hash,
+        )
+        if index_file is not None and index_file.is_file():
+            is_sharded = True
+
         # load model
         model_file = None
-        if use_safetensors:
-            try:
+        if from_flax:
+            raise NotImplementedError("loading flax checkpoint in mindspore model is not yet supported.")
+        else:
+            if is_sharded:
+                sharded_ckpt_cached_folder, sharded_metadata = _get_checkpoint_shard_files(
+                    pretrained_model_name_or_path,
+                    index_file,
+                    cache_dir=cache_dir,
+                    proxies=proxies,
+                    resume_download=resume_download,
+                    local_files_only=local_files_only,
+                    token=token,
+                    user_agent=user_agent,
+                    revision=revision,
+                    subfolder=subfolder or "",
+                )
+
+            elif use_safetensors and not is_sharded:
+                try:
+                    model_file = _get_model_file(
+                        pretrained_model_name_or_path,
+                        weights_name=_add_variant(SAFETENSORS_WEIGHTS_NAME, variant),
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        resume_download=resume_download,
+                        proxies=proxies,
+                        local_files_only=local_files_only,
+                        token=token,
+                        revision=revision,
+                        subfolder=subfolder,
+                        user_agent=user_agent,
+                        commit_hash=commit_hash,
+                    )
+                except IOError as e:
+                    logger.error(f"An error occurred while trying to fetch {pretrained_model_name_or_path}: {e}")
+                    if not allow_pickle:
+                        raise
+                    logger.warning(
+                        "Defaulting to unsafe serialization. Pass `allow_pickle=False` to raise an error instead."
+                    )
+
+            if model_file is None and not is_sharded:
                 model_file = _get_model_file(
                     pretrained_model_name_or_path,
-                    weights_name=_add_variant(SAFETENSORS_WEIGHTS_NAME, variant),
+                    weights_name=_add_variant(WEIGHTS_NAME, variant),
                     cache_dir=cache_dir,
                     force_download=force_download,
                     resume_download=resume_download,
@@ -422,45 +567,34 @@ class ModelMixin(nn.Cell, PushToHubMixin):
                     user_agent=user_agent,
                     commit_hash=commit_hash,
                 )
-            except IOError as e:
-                if not allow_pickle:
-                    raise e
-                pass
-        if model_file is None:
-            model_file = _get_model_file(
-                pretrained_model_name_or_path,
-                weights_name=_add_variant(WEIGHTS_NAME, variant),
-                cache_dir=cache_dir,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                local_files_only=local_files_only,
-                token=token,
-                revision=revision,
-                subfolder=subfolder,
-                user_agent=user_agent,
-                commit_hash=commit_hash,
-            )
 
-        model = cls.from_config(config, **unused_kwargs)
+            model = cls.from_config(config, **unused_kwargs)
 
-        state_dict = load_state_dict(model_file, variant=variant)
-        model._convert_deprecated_attention_blocks(state_dict)
+            if is_sharded:
+                load_checkpoint_and_dispatch(
+                    model,
+                    sharded_ckpt_cached_folder,
+                    dtype=mindspore_dtype,
+                    strict=True,
+                )
+            else:
+                state_dict = load_state_dict(model_file, variant=variant)
+                model._convert_deprecated_attention_blocks(state_dict)
 
-        model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
-            model,
-            state_dict,
-            model_file,
-            pretrained_model_name_or_path,
-            ignore_mismatched_sizes=ignore_mismatched_sizes,
-        )
+                model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
+                    model,
+                    state_dict,
+                    model_file,
+                    pretrained_model_name_or_path,
+                    ignore_mismatched_sizes=ignore_mismatched_sizes,
+                )
 
-        loading_info = {
-            "missing_keys": missing_keys,
-            "unexpected_keys": unexpected_keys,
-            "mismatched_keys": mismatched_keys,
-            "error_msgs": error_msgs,
-        }
+                loading_info = {
+                    "missing_keys": missing_keys,
+                    "unexpected_keys": unexpected_keys,
+                    "mismatched_keys": mismatched_keys,
+                    "error_msgs": error_msgs,
+                }
 
         if mindspore_dtype is not None and not isinstance(mindspore_dtype, ms.Type):
             raise ValueError(
@@ -473,7 +607,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
 
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.set_train(False)
-        if output_loading_info:
+        if not is_sharded and output_loading_info:
             return model, loading_info
 
         return model
@@ -489,7 +623,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
     ):
         state_dict = _convert_state_dict(model, state_dict)
         # Retrieve missing & unexpected_keys
-        model_state_dict = model.parameters_dict()
+        model_state_dict = {k: v for k, v in model.parameters_and_names()}
         loaded_keys = list(state_dict.keys())
 
         expected_keys = list(model_state_dict.keys())
@@ -583,6 +717,15 @@ class ModelMixin(nn.Cell, PushToHubMixin):
 
         return model, missing_keys, unexpected_keys, mismatched_keys, error_msgs
 
+    @classmethod
+    def _get_signature_keys(cls, obj):
+        parameters = inspect.signature(obj.__init__).parameters
+        required_parameters = {k: v for k, v in parameters.items() if v.default == inspect._empty}
+        optional_parameters = set({k for k, v in parameters.items() if v.default != inspect._empty})
+        expected_modules = set(required_parameters.keys()) - {"self"}
+
+        return expected_modules, optional_parameters
+
     def to(self, dtype: Optional[ms.Type] = None):
         for p in self.get_parameters():
             p.set_dtype(dtype)
@@ -621,7 +764,7 @@ class ModelMixin(nn.Cell, PushToHubMixin):
         Example:
 
         ```py
-        from diffusers import UNet2DConditionModel
+        from mindone.diffusers import UNet2DConditionModel
 
         model_id = "runwayml/stable-diffusion-v1-5"
         unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
@@ -686,3 +829,58 @@ class ModelMixin(nn.Cell, PushToHubMixin):
                 state_dict[f"{path}.to_out.0.weight"] = state_dict.pop(f"{path}.proj_attn.weight")
             if f"{path}.proj_attn.bias" in state_dict:
                 state_dict[f"{path}.to_out.0.bias"] = state_dict.pop(f"{path}.proj_attn.bias")
+
+
+class LegacyModelMixin(ModelMixin):
+    r"""
+    A subclass of `ModelMixin` to resolve class mapping from legacy classes (like `Transformer2DModel`) to more
+    pipeline-specific classes (like `DiTTransformer2DModel`).
+    """
+
+    @classmethod
+    @validate_hf_hub_args
+    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
+        # To prevent depedency import problem.
+        from .model_loading_utils import _fetch_remapped_cls_from_config
+
+        # Create a copy of the kwargs so that we don't mess with the keyword arguments in the downstream calls.
+        kwargs_copy = kwargs.copy()
+
+        cache_dir = kwargs.pop("cache_dir", None)
+        force_download = kwargs.pop("force_download", False)
+        resume_download = kwargs.pop("resume_download", None)
+        proxies = kwargs.pop("proxies", None)
+        local_files_only = kwargs.pop("local_files_only", None)
+        token = kwargs.pop("token", None)
+        revision = kwargs.pop("revision", None)
+        subfolder = kwargs.pop("subfolder", None)
+
+        # Load config if we don't provide a configuration
+        config_path = pretrained_model_name_or_path
+
+        user_agent = {
+            "diffusers": __version__,
+            "file_type": "model",
+            "framework": "pytorch",
+        }
+
+        # load config
+        config, _, _ = cls.load_config(
+            config_path,
+            cache_dir=cache_dir,
+            return_unused_kwargs=True,
+            return_commit_hash=True,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            subfolder=subfolder,
+            user_agent=user_agent,
+            **kwargs,
+        )
+        # resolve remapping
+        remapped_class = _fetch_remapped_cls_from_config(config, cls)
+
+        return remapped_class.from_pretrained(pretrained_model_name_or_path, **kwargs_copy)

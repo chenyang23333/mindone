@@ -15,6 +15,7 @@ from gm.modules.diffusionmodules.util import (
 )
 from gm.util import default, exists
 
+import mindspore as ms
 from mindspore import jit, nn, ops
 
 _logger = logging.getLogger(__name__)
@@ -69,14 +70,10 @@ class Upsample(nn.Cell):
             t_factor = 1 if not self.third_up else 2
 
             # x = ops.interpolate(x, size=(t_factor * x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest",)
-            x = ops.ResizeNearestNeighbor(
-                size=(t_factor * x.shape[2], x.shape[3] * 2, x.shape[4] * 2),
-            )(x)
+            x = ops.ResizeNearestNeighborV2()(x, (t_factor * x.shape[2], x.shape[3] * 2, x.shape[4] * 2))
         else:
             # x = ops.interpolate(x, size=(x.shape[-2] * 2, x.shape[-1] * 2), mode="nearest")  # scale_factor=2., (not support with ms2.1)
-            x = ops.ResizeNearestNeighbor(
-                size=(x.shape[-2] * 2, x.shape[-1] * 2),
-            )(x)
+            x = ops.ResizeNearestNeighborV2()(x, (x.shape[-2] * 2, x.shape[-1] * 2))
         if self.use_conv:
             x = self.conv(x)
         return x
@@ -321,7 +318,8 @@ class QKVAttentionLegacy(nn.Cell):
         # )  # More stable with f16 than dividing afterwards
         weight = ops.BatchMatMul()((q * scale).transpose(0, 2, 1), (k * scale))  # (b, c, t) -> (b, t, c)  # (b, c, s)
 
-        weight = ops.softmax(weight, axis=-1)
+        _weight_dtype = weight.dtype
+        weight = ops.softmax(weight.astype(ms.float32), axis=-1).astype(_weight_dtype)
 
         # a = th.einsum("bts,bcs->bct", weight, v)
         a = ops.BatchMatMul()(weight, v.transpose(0, 2, 1)).transpose(  # (b, t, s)  # (b, c, s) -> (b, s, c)
@@ -362,7 +360,8 @@ class QKVAttention(nn.Cell):
             (k * scale).view(bs * self.n_heads, ch, length),  # (b, c, s)
         )
 
-        weight = ops.softmax(weight, axis=-1)
+        _weight_dtype = weight.dtype
+        weight = ops.softmax(weight.astype(ms.float32), axis=-1).astype(_weight_dtype)
 
         # a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         a = ops.BatchMatMul()(

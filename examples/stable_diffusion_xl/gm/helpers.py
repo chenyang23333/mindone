@@ -1,7 +1,5 @@
-import copy
 import logging
 import os
-import time
 from datetime import datetime
 from typing import List, Union
 
@@ -24,7 +22,7 @@ from gm.modules.diffusionmodules.sampler import (
     LinearMultistepSampler,
 )
 from gm.util import auto_mixed_precision, get_obj_from_str, instantiate_from_config, seed_everything
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig
 from PIL import Image
 
 import mindspore as ms
@@ -113,6 +111,19 @@ def set_default(args):
         context.set_context(max_device_memory=args.max_device_memory)
         context.set_context(memory_optimize_level="O1", ascend_config={"atomic_clean_policy": 1})
 
+    try:
+        if args.jit_level in ["O0", "O1", "O2"]:
+            ms.set_context(jit_config={"jit_level": args.jit_level})
+            print(f"set jit_level: {args.jit_level}.")
+        else:
+            print(
+                f"WARNING: Unsupport jit_level: {args.jit_level}. The framework automatically selects the execution method"
+            )
+    except Exception:
+        print(
+            "WARNING: The current jit_level is not suitable because current MindSpore version or mode does not match,"
+            "please ensure the MindSpore version >= ms2.3.0, and use GRAPH_MODE."
+        )
     # Set Parallel
     if args.is_parallel:
         init()
@@ -126,9 +137,15 @@ def set_default(args):
 
     # data sink step
     if args.data_sink:
-        if os.environ.get("MS_DATASET_SINK_QUEUE") is None:
-            os.environ["MS_DATASET_SINK_QUEUE"] = "10"
-            print("WARNING: Set env `MS_DATASET_SINK_QUEUE` to 10.")
+        if args.sink_queue_size > 1:
+            os.environ["MS_DATASET_SINK_QUEUE"] = f"{args.sink_queue_size}"
+            print(f"WARNING: Set env `MS_DATASET_SINK_QUEUE` to {args.sink_queue_size}.")
+        else:
+            if os.environ.get("MS_DATASET_SINK_QUEUE") is None:
+                os.environ["MS_DATASET_SINK_QUEUE"] = "10"
+                print("WARNING: Set env `MS_DATASET_SINK_QUEUE` to 10.")
+            else:
+                print(f"env `MS_DATASET_SINK_QUEUE`: {os.environ.get('MS_DATASET_SINK_QUEUE')}")
 
         assert args.dataset_load_tokenizer
         args.log_interval = args.sink_size
@@ -158,6 +175,8 @@ def set_default(args):
     if args.rank % args.rank_size == 0:
         with open(os.path.join(args.save_path, "cfg.yaml"), "w") as f:
             yaml.dump(vars(args), f, sort_keys=False)
+    if args.max_num_ckpt is not None and args.max_num_ckpt <= 0:
+        raise ValueError("args.max_num_ckpt must be None or a positive integer!")
 
     # Modelarts: Copy data/ckpt, from the s3 bucket to the computing node; Reset dataset dir.
     if args.enable_modelarts:
@@ -248,46 +267,43 @@ def create_model(
     load_first_stage_model: bool = True,
     load_conditioner: bool = True,
 ):
-    # create model
-    model = load_model_from_config(
-        config.model,
-        checkpoints,
-        amp_level=amp_level,
-        load_first_stage_model=load_first_stage_model,
-        load_conditioner=load_conditioner,
-    )
+    from gm.models.diffusion import DiffusionEngine, DiffusionEngineControlNet, DiffusionEngineDreamBooth
+
+    assert config.model["target"] in [
+        "gm.models.diffusion.DiffusionEngine",
+        "gm.models.diffusion.DiffusionEngineDreamBooth",
+        "gm.models.diffusion.DiffusionEngineControlNet",
+    ], f"Not supported for `class {config.model['target']}`"
+
+    # create diffusion engine
+    config.model["params"]["load_first_stage_model"] = load_first_stage_model
+    config.model["params"]["load_conditioner"] = load_conditioner
+    target_map = {
+        "gm.models.diffusion.DiffusionEngine": DiffusionEngine,
+        "gm.models.diffusion.DiffusionEngineDreamBooth": DiffusionEngineDreamBooth,
+        "gm.models.diffusion.DiffusionEngineControlNet": DiffusionEngineControlNet,
+    }
+    sdxl = target_map[config.model["target"]](**config.model.get("params", dict()))
+
+    # load pretrained
+    sdxl.load_pretrained(checkpoints)
+
+    # set auto-mix-precision
+    sdxl = auto_mixed_precision(sdxl, amp_level=amp_level)
+    sdxl.set_train(False)
+
+    # set model parameter/weight dtype to fp16
+    if param_fp16:
+        print(
+            "!!! WARNING: Converted the weight to `fp16`, that may lead to unstable training. You can turn it off by setting `--param_fp16=False`"
+        )
+        convert_sdxl_to_fp16(sdxl)
 
     if freeze:
-        model.set_train(False)
-        model.set_grad(False)
-        for _, p in model.parameters_and_names():
+        sdxl.set_train(False)
+        sdxl.set_grad(False)
+        for _, p in sdxl.parameters_and_names():
             p.requires_grad = False
-
-    if param_fp16:
-        convert_modules = ()
-        if load_conditioner:
-            convert_modules += (model.conditioner,)
-        if load_first_stage_model:
-            convert_modules += (model.first_stage_model,)
-
-        if isinstance(model.model, nn.Cell):
-            convert_modules += (model.model,)
-        else:
-            assert hasattr(model, "stage1") and isinstance(model.stage1, nn.Cell)
-            convert_modules += (model.stage1, model.stage2)
-
-        for module in convert_modules:
-            k_num, c_num = 0, 0
-            for _, p in module.parameters_and_names():
-                # filter norm/embedding position_ids param
-                if ("position_ids" in p.name) or ("norm" in p.name):
-                    # print(f"param {p.name} keep {p.dtype}") # disable print
-                    k_num += 1
-                else:
-                    c_num += 1
-                    p.set_dtype(ms.float16)
-
-            print(f"Convert `{type(module).__name__}` param to fp16, keep/modify num {k_num}/{c_num}.")
 
     if load_filter:
         # TODO: Add DeepFloydDataFiltering
@@ -297,11 +313,42 @@ def create_model(
         assert os.path.exists(textual_inversion_ckpt), f"{textual_inversion_ckpt} does not exist!"
         from gm.modules.textual_inversion.manager import TextualInversionManager
 
-        manager = TextualInversionManager(model, placeholder_token, num_vectors)
+        manager = TextualInversionManager(sdxl, placeholder_token, num_vectors)
         manager.load_checkpoint_textual_inversion(textual_inversion_ckpt, verbose=True)
-        return (model, manager), None
+        return (sdxl, manager), None
 
-    return model, None
+    return sdxl, None
+
+
+def convert_sdxl_to_fp16(sdxl):
+    vae = sdxl.first_stage_model
+    text_encoders = sdxl.conditioner
+    unet = sdxl.model
+
+    convert_to_fp16(vae)
+    convert_to_fp16(text_encoders)
+    convert_to_fp16(unet)
+
+
+def convert_to_fp16(model, keep_norm_fp32=True):
+    if model is not None:
+        assert isinstance(model, nn.Cell)
+
+        k_num, c_num = 0, 0
+        for _, p in model.parameters_and_names():
+            # filter norm/embedding position_ids param
+            if keep_norm_fp32 and ("norm" in p.name):
+                # print(f"param {p.name} keep {p.dtype}") # disable print
+                k_num += 1
+            elif "position_ids" in p.name:
+                k_num += 1
+            else:
+                c_num += 1
+                p.set_dtype(ms.float16)
+
+        print(f"Convert `{type(model).__name__}` param to fp16, keep/modify num {k_num}/{c_num}.")
+
+    return model
 
 
 def get_grad_reducer(is_parallel, parameters):
@@ -412,65 +459,6 @@ def get_optimizer(optim_config, lr, params, filtering=True, group_lr_scaler=None
     )
 
     return optimizer
-
-
-def load_model_from_config(
-    model_config, ckpts=None, verbose=True, amp_level="O0", load_first_stage_model=True, load_conditioner=True
-):
-    model_config["params"]["load_first_stage_model"] = load_first_stage_model
-    model_config["params"]["load_conditioner"] = load_conditioner
-    model = instantiate_from_config(model_config)
-
-    from gm.models.diffusion import DiffusionEngineMultiGraph
-
-    if ckpts:
-        logging.info(f"Loading model from {ckpts}")
-        if not isinstance(model, DiffusionEngineMultiGraph):
-            if isinstance(ckpts, str):
-                ckpts = [ckpts]
-
-            sd_dict = {}
-            for ckpt in ckpts:
-                assert ckpt.endswith(".ckpt")
-                _sd_dict = ms.load_checkpoint(ckpt)
-                sd_dict.update(_sd_dict)
-
-                if "global_step" in sd_dict:
-                    global_step = sd_dict["global_step"]
-                    print(f"loaded ckpt from global step {global_step}")
-                    print(f"Global Step: {sd_dict['global_step']}")
-
-            # FIXME: parameter auto-prefix name bug on mindspore 2.2.10
-            sd_dict = {k.replace("._backbone", ""): v for k, v in sd_dict.items()}
-
-            # filter first_stage_model and conditioner
-            _keys = copy.deepcopy(list(sd_dict.keys()))
-            for _k in _keys:
-                if not load_first_stage_model and _k.startswith("first_stage_model."):
-                    sd_dict.pop(_k)
-                if not load_conditioner and _k.startswith("conditioner."):
-                    sd_dict.pop(_k)
-
-            m, u = ms.load_param_into_net(model, sd_dict, strict_load=False)
-
-            if len(m) > 0 and verbose:
-                ignore_lora_key = len(ckpts) == 1
-                m = m if not ignore_lora_key else [k for k in m if "lora_" not in k]
-                print("missing keys:")
-                print(m)
-            if len(u) > 0 and verbose:
-                print("unexpected keys:")
-                print(u)
-        else:
-            model.load_pretrained(ckpts, verbose=verbose)
-    else:
-        logging.warning("No checkpoints were provided.")
-
-    if not isinstance(model, DiffusionEngineMultiGraph):
-        model = auto_mixed_precision(model, amp_level=amp_level)
-        model.set_train(False)
-
-    return model
 
 
 def load_checkpoint(model, ckpt, verbose=True, remove_prefix=None):
@@ -924,42 +912,6 @@ def load_img(image):
     image = image[None].transpose(0, 3, 1, 2)  # (h, w, c) -> (1, c, h, w)
     image = image / 127.5 - 1.0  # norm to (-1, 1)
     return image
-
-
-def pre_compile_graph(config_path, per_batch_size, train_step_fn, rank, max_embeddings_multiples):
-    config = OmegaConf.load(config_path)
-    dataset_config = config.data.dataset_config
-    per_batch_size = config.data.pop("per_batch_size") if per_batch_size is None else per_batch_size
-
-    if "target_size" in dataset_config["params"]:
-        img_size = dataset_config["params"]["target_size"]
-    else:
-        img_size = dataset_config["params"]["multi_aspect"]
-    for i in range(max_embeddings_multiples):
-        if isinstance(img_size, int):
-            h, w = img_size, img_size
-            s_time = time.time()
-            image, tokens = Tensor(np.random.rand(per_batch_size, 3, h, w), ms.float32), (
-                Tensor(np.random.rand(per_batch_size, 75 * (i + 1) + 2), ms.int32),
-                Tensor(np.random.rand(per_batch_size, 75 * (i + 1) + 2), ms.int32),
-                Tensor(np.random.rand(per_batch_size, 2), ms.float32),
-                Tensor(np.random.rand(per_batch_size, 2), ms.float32),
-                Tensor(np.random.rand(per_batch_size, 2), ms.float32),
-            )
-            loss, overflow = train_step_fn(image, *tokens)
-            print(f"Pre Compile, Rank: {rank}, time cost: {(time.time()-s_time) * 1000} ms")
-        else:
-            for h, w in img_size:
-                s_time = time.time()
-                image, tokens = Tensor(np.random.rand(per_batch_size, 3, h, w), ms.float32), (
-                    Tensor(np.random.rand(per_batch_size, 75 * (i + 1) + 2), ms.int32),
-                    Tensor(np.random.rand(per_batch_size, 75 * (i + 1) + 2), ms.int32),
-                    Tensor(np.random.rand(per_batch_size, 2), ms.float32),
-                    Tensor(np.random.rand(per_batch_size, 2), ms.float32),
-                    Tensor(np.random.rand(per_batch_size, 2), ms.float32),
-                )
-                loss, overflow = train_step_fn(image, *tokens)
-                print(f"Pre Compile, Rank: {rank}, time cost: {(time.time()-s_time) * 1000} ms")
 
 
 class EMA(nn.Cell):

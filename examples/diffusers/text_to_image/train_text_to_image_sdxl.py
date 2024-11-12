@@ -23,24 +23,32 @@ import math
 import os
 import random
 import shutil
-import time
-from multiprocessing import Process, SimpleQueue
 from pathlib import Path
 
+import datasets
 import numpy as np
 import yaml
-from datasets import load_dataset
+from datasets import disable_caching, load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
 import mindspore as ms
-from mindspore import Tensor, context, nn, ops
-from mindspore.amp import DynamicLossScaler, LossScaler, StaticLossScaler, all_finite
+from mindspore import Tensor, nn, ops
+from mindspore.amp import StaticLossScaler
 from mindspore.dataset import GeneratorDataset, transforms, vision
 
 from mindone.diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline, UNet2DConditionModel
+from mindone.diffusers.models.layers_compat import multinomial
 from mindone.diffusers.optimization import get_scheduler
-from mindone.diffusers.training_utils import compute_snr, init_distributed_device, is_master, set_seed
+from mindone.diffusers.training_utils import (
+    AttrJitWrapper,
+    TrainStep,
+    compute_snr,
+    init_distributed_device,
+    is_master,
+    maybe_compile,
+    set_seed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -343,9 +351,17 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=1,
+        help="Number of subprocesses to use for data loading.",
+    )
+    parser.add_argument(
+        "--enable_mindspore_data_sink",
+        action="store_true",
         help=(
-            "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
+            "Whether or not to enable `Data Sinking` feature from MindData which boosting data "
+            "fetching and transferring from host to device. For more information, see "
+            "https://www.mindspore.cn/tutorials/experts/en/r2.2/optimize/execution_opt.html#data-sinking. "
+            "Note: To avoid breaking the iteration logic of the training, the size of data sinking is set to 1."
         ),
     )
     parser.add_argument(
@@ -421,14 +437,9 @@ def parse_args(input_args=None):
     def error_template(feature, flag):
         return f"{feature} is not yet supported, please do not set --{flag}"
 
-    assert args.gradient_accumulation_steps == 1, error_template("Gradient Accumulation", "gradient_accumulation_steps")
-    assert args.gradient_checkpointing is False, error_template("Gradient Checkpointing", "gradient_checkpointing")
     assert args.use_ema is False, error_template("Exponential Moving Average", "use_ema")
     assert args.allow_tf32 is False, error_template("TF32 Data Type", "allow_tf32")
     assert args.use_8bit_adam is False, error_template("AdamW8bit", "use_8bit_adam")
-    assert args.enable_xformers_memory_efficient_attention is False, error_template(
-        "Memory Efficient Attention from 'xformers'", "enable_xformers_memory_efficient_attention"
-    )
     if args.push_to_hub is True:
         raise ValueError(
             "You cannot use --push_to_hub due to a security risk of uploading your data to huggingface-hub. "
@@ -513,6 +524,9 @@ def generate_timestep_weights(args, num_timesteps):
                 "When using the range strategy for timestep bias, you must provide an ending timestep smaller than the number of timesteps."
             )
         bias_indices = slice(range_begin, range_end)
+        num_to_bias = range_end - range_begin
+        if range_end < 0:
+            num_to_bias += num_timesteps
     else:  # 'none' or any other string
         return weights
     if args.timestep_bias_multiplier <= 0:
@@ -523,7 +537,7 @@ def generate_timestep_weights(args, num_timesteps):
         )
 
     # Apply the bias
-    weights[bias_indices] *= args.timestep_bias_multiplier
+    weights[bias_indices] = ops.ones(num_to_bias) * args.timestep_bias_multiplier
 
     # Normalize
     weights /= weights.sum()
@@ -545,6 +559,7 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+    datasets.utils.logging.get_logger().propagate = False
 
     # If passed along, set the training seed now.
     if args.seed is not None:
@@ -608,7 +623,7 @@ def main():
     # Freeze vae and text encoders.
     def freeze_params(m: nn.Cell):
         for p in m.get_parameters():
-            p.require_grad = False
+            p.requires_grad = False
 
     freeze_params(vae)
     freeze_params(text_encoder_one)
@@ -630,40 +645,37 @@ def main():
     text_encoder_one.to(weight_dtype)
     text_encoder_two.to(weight_dtype)
 
-    # TODO: support EMA, xformers_memory_efficient_attention, gradient_checkpointing, TF32, AdamW8bit
+    # TODO: support EMA, TF32, AdamW8bit
 
-    if args.scale_lr:
-        args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * args.world_size
-        )
+    if args.enable_xformers_memory_efficient_attention:
+        unet.enable_xformers_memory_efficient_attention()
 
-    # Optimizer creation
-    params_to_optimize = unet.trainable_params()
-    optimizer = nn.AdamWeightDecay(  # will silently filter bn and bias
-        params_to_optimize,
-        learning_rate=args.learning_rate,
-        beta1=args.adam_beta1,
-        beta2=args.adam_beta2,
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-    from datasets import disable_caching
-
     if args.cache_dir is None:
         disable_caching()
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
+        if args.dataset_name == "webdataset" or args.dataset_name == "imagefolder":
+            # Packaged dataset
+            dataset = load_dataset(
+                args.dataset_name,
+                data_dir=args.train_data_dir,
+                cache_dir=args.cache_dir,
+                # setting streaming=True when using webdataset gives DatasetIter which has different process apis
+            )
+        else:
+            # Downloading and loading a dataset from the hub.
+            dataset = load_dataset(
+                args.dataset_name,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+            )
     else:
         data_files = {}
         if args.train_data_dir is not None:
@@ -727,8 +739,6 @@ def main():
                 th, tw = args.resolution, args.resolution
                 if h < th or w < tw:
                     raise ValueError(f"Required crop size {(th, tw)} is larger than input image size {(h, w)}")
-                if w == tw and h == th:
-                    return 0, 0, h, w
                 y1 = np.random.randint(0, h - th + 1, size=(1,)).item()
                 x1 = np.random.randint(0, w - tw + 1, size=(1,)).item()
                 image = image.crop((x1, y1, x1 + tw, y1 + th))
@@ -802,8 +812,11 @@ def main():
         column_names=UnravelDataset.columns,
         shuffle=True,
         num_parallel_workers=args.dataloader_num_workers,
+        num_shards=args.world_size,
+        shard_id=args.rank,
     ).batch(
         batch_size=args.train_batch_size,
+        num_parallel_workers=args.dataloader_num_workers,
     )
 
     # Scheduler and math around the number of training steps.
@@ -813,15 +826,32 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
+    if args.scale_lr:
+        args.learning_rate = (
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * args.world_size
+        )
+
     lr_scheduler = get_scheduler(  # noqa: F841
         args.lr_scheduler,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        args.learning_rate,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
+    )
+
+    # Optimizer creation
+    params_to_optimize = unet.trainable_params()
+    optimizer = nn.AdamWeightDecay(  # will silently filter bn and bias
+        params_to_optimize,
+        learning_rate=lr_scheduler,
+        beta1=args.adam_beta1,
+        beta2=args.adam_beta2,
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
     )
 
     # Prepare everything with our `accelerator`.
     # todo: auto mixed precision here
-    unet.to(weight_dtype)  # maybe using `to_float(weight_dtype)` give higher accuracy?
+    unet.to_float(weight_dtype)  # maybe using `to(weight_dtype)` gives faster performance?
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -845,43 +875,24 @@ def main():
 
     # todo: may write the function `unwrap_model` to remove the disgusting _backbone prefix after amp?
 
-    train_step = TrainStep(
+    train_step = TrainStepForSDXL(
         unet=unet,
         optimizer=optimizer,
-        scaler=StaticLossScaler(65536),
         noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+        length_of_dataloader=len(train_dataloader),
         args=args,
     ).set_train()
 
-    def compile_progress_bar(q: SimpleQueue, duration: int):
-        pb = tqdm(total=duration, bar_format="{l_bar}{bar}| [{elapsed}<{remaining}]", disable=not is_master(args))
-        while True:
-            if q.empty():
-                time.sleep(1)
-                if pb.last_print_n < duration:
-                    pb.update(1)
-                else:
-                    pb.refresh(lock_args=pb.lock_args)
-            else:
-                pb.update(duration - pb.last_print_n)
-                pb.close()
-                break
-
-    def maybe_compile(m: nn.Cell, *model_args, **model_kwargs):
-        if os.getenv("MS_JIT") != "0" and context._get_mode() == context.GRAPH_MODE:
-            logger.info(f"Compiling {m.__class__.__name__}...")
-            estimated_duration = sum(p.numel() for p in m.get_parameters()) * 2e-7
-            q = SimpleQueue()
-            p = Process(target=compile_progress_bar, args=(q, estimated_duration))
-            p.start()
-            compile_begin = time.perf_counter()
-            m.compile(*model_args, **model_kwargs)
-            compile_end = time.perf_counter()
-            q.put(compile_end - compile_begin)
-            p.join()
-            logger.info(f"Compiling is finished, elapsed time {compile_end - compile_begin:.2f} s")
-
-    maybe_compile(train_step, *[x.to(weight_dtype) for x in next(iter(train_dataloader))])
+    if args.enable_mindspore_data_sink:
+        sink_process = ms.data_sink(train_step, train_dataloader)
+        logger.warning(
+            "Data sinking is enable by setting `--enable_mindspore_data_sink`. "
+            "Model compiling will be done implicitly in the first step of first epoch if you are using `Graph Mode`"
+        )
+    else:
+        sink_process = None
+        maybe_compile(train_step, is_master(args), *[x.to(weight_dtype) for x in next(iter(train_dataloader))])
 
     # create pipeline for validation
     pipeline = StableDiffusionXLPipeline(
@@ -927,8 +938,9 @@ def main():
         else:
             if is_master(args):
                 logger.info(f"Resuming from checkpoint {path}")
-            state_dict = ms.load_checkpoint(os.path.join(args.output_dir, path))
-            ms.load_param_into_net(unet, state_dict)  # todo: what about optimizer and scaler?
+            # TODO: load optimizer & grad scaler etc. like accelerator.load_state
+            input_model_file = os.path.join(args.output_dir, path, "pytorch_model.ckpt")
+            ms.load_param_into_net(unet, ms.load_checkpoint(input_model_file))
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -949,44 +961,58 @@ def main():
         disable=not is_master(args),
     )
 
+    train_dataloader_iter = train_dataloader.create_tuple_iterator(num_epochs=args.num_train_epochs - first_epoch)
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.set_train(True)
-        for step, batch in enumerate(train_dataloader):
-            # todo: support accumulation
-            batch = [x.to(weight_dtype) for x in batch]
-            loss = train_step(*batch)
+        train_loss = 0.0
+        for step, batch in (
+            ((_, None) for _ in range(len(train_dataloader)))  # dummy iterator
+            if args.enable_mindspore_data_sink
+            else enumerate(train_dataloader_iter)
+        ):
+            if args.enable_mindspore_data_sink:
+                loss, model_pred = sink_process()
+            else:
+                batch = [x.to(weight_dtype) for x in batch]
+                loss, model_pred = train_step(*batch)
+            train_loss += loss.numpy().item()
 
-            progress_bar.update(1)
-            global_step += 1
-            for tracker_name, tracker in trackers.items():
-                if tracker_name == "tensorboard":
-                    tracker.add_scalar("train/loss", loss.numpy().item(), global_step)
+            if train_step.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                for tracker_name, tracker in trackers.items():
+                    if tracker_name == "tensorboard":
+                        tracker.add_scalar("train/loss", train_loss, global_step)
+                train_loss = 0.0
 
-            if is_master(args):
-                if global_step % args.checkpointing_steps == 0:
-                    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                    if args.checkpoints_total_limit is not None:
-                        checkpoints = os.listdir(args.output_dir)
-                        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                if is_master(args):
+                    if global_step % args.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                        # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                        if len(checkpoints) >= args.checkpoints_total_limit:
-                            num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                            removing_checkpoints = checkpoints[0:num_to_remove]
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
 
-                            logger.info(
-                                f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                            )
-                            logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
-                            for removing_checkpoint in removing_checkpoints:
-                                removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                shutil.rmtree(removing_checkpoint)
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
 
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    ms.save_checkpoint(unet, save_path)  # todo: save trainer?
-                    logger.info(f"Saved state to {save_path}")
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        # TODO: save optimizer & grad scaler etc. like accelerator.save_state
+                        os.makedirs(save_path, exist_ok=True)
+                        output_model_file = os.path.join(save_path, "pytorch_model.ckpt")
+                        ms.save_checkpoint(unet, output_model_file)
+                        logger.info(f"Saved state to {save_path}")
 
             logs = {"step_loss": loss.numpy().item(), "lr": optimizer.get_lr().numpy().item()}
             progress_bar.set_postfix(**logs)
@@ -1010,57 +1036,38 @@ def main():
             tracker.close()
 
 
-class TrainStep(nn.Cell):
+class TrainStepForSDXL(TrainStep):
     def __init__(
         self,
         unet: nn.Cell,
         optimizer: nn.Optimizer,
-        scaler: LossScaler,
         noise_scheduler,
+        weight_dtype,
+        length_of_dataloader,
         args,
     ):
-        super().__init__()
-        self.unet = unet.set_grad()
-        self.optimizer = optimizer
-        self.weights = optimizer.parameters
-        self.scaler = scaler
-        if isinstance(self.scaler, StaticLossScaler):
-            self.drop_overflow = False
-        elif isinstance(self.scaler, DynamicLossScaler):
-            self.drop_overflow = True
-        else:
-            raise NotImplementedError(f"Unsupported scaler: {type(self.scaler)}")
-        self.parallel_mode = context.get_auto_parallel_context("parallel_mode")
-        if self.parallel_mode == context.ParallelMode.STAND_ALONE:
-            self.grad_reducer = nn.Identity()
-        elif self.parallel_mode in (context.ParallelMode.DATA_PARALLEL, context.ParallelMode.HYBRID_PARALLEL):
-            self.grad_reducer = nn.DistributedGradReducer(self.weights)
-        else:
-            raise NotImplementedError(f"When creating reducer, Got Unsupported parallel mode: {self.parallel_mode}")
-        if isinstance(unet, nn.Cell) and unet.jit_config_dict:
-            self._jit_config_dict = unet.jit_config_dict
-        self.clip_grad = args.max_grad_norm is not None
-        self.clip_value = args.max_grad_norm
-
-        @ms.jit_class
-        class ArgsJitWrapper:
-            def __init__(self, **kwargs):
-                for name in kwargs:
-                    setattr(self, name, kwargs[name])
-
-        self.args = ArgsJitWrapper(**vars(args))
+        super().__init__(
+            unet,
+            optimizer,
+            StaticLossScaler(65536),
+            args.max_grad_norm,
+            args.gradient_accumulation_steps,
+            gradient_accumulation_kwargs=dict(length_of_dataloader=length_of_dataloader),
+        )
+        self.unet = self.model
         self.noise_scheduler = noise_scheduler
         self.noise_scheduler_num_train_timesteps = noise_scheduler.config.num_train_timesteps
         self.noise_scheduler_prediction_type = noise_scheduler.config.prediction_type
-
-        self.forward_and_backward = ops.value_and_grad(self.forward, None, weights=self.weights, has_aux=True)
+        self.weight_dtype = weight_dtype
+        self.args = AttrJitWrapper(**vars(args))
 
     def forward(self, model_input, prompt_embeds, pooled_prompt_embeds, add_time_ids):
         # Sample noise that we'll add to the latents
-        noise = ops.randn_like(model_input)
+        noise = ops.randn_like(model_input, dtype=model_input.dtype)
         if self.args.noise_offset:
             # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-            noise += self.args.noise_offset * ops.randn((model_input.shape[0], model_input.shape[1], 1, 1))
+            noise_offset = self.args.noise_offset * ops.randn((model_input.shape[0], model_input.shape[1], 1, 1))
+            noise += noise_offset.to(noise.dtype)
 
         bsz = model_input.shape[0]
         if self.args.timestep_bias_strategy == "none":
@@ -1069,8 +1076,9 @@ class TrainStep(nn.Cell):
         else:
             # Sample a random timestep for each image, potentially biased by the timestep weights.
             # Biasing the timestep weights allows us to spend less time training irrelevant timesteps.
+            # Use our own implemented multinomial generator because ops.multinomial is invalid on some hardware.
             weights = generate_timestep_weights(self.args, self.noise_scheduler_num_train_timesteps)
-            timesteps = ops.multinomial(weights, bsz, replacement=True).long()
+            timesteps = multinomial(weights, bsz, replacement=True).long()
 
         # Add noise to the model input according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
@@ -1118,31 +1126,8 @@ class TrainStep(nn.Cell):
             loss = loss.mean(axis=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
-        loss = self.scaler.scale(loss)
+        loss = self.scale_loss(loss)
         return loss, model_pred
-
-    def update(self, loss, grads):
-        if self.clip_grad:
-            loss = ops.depend(loss, self.optimizer(ops.clip_by_global_norm(grads, clip_norm=self.clip_value)))
-        else:
-            loss = ops.depend(loss, self.optimizer(grads))
-        return loss
-
-    def construct(self, *inputs):
-        (loss, model_pred), grads = self.forward_and_backward(*inputs)
-        grads = self.grad_reducer(grads)
-        loss = self.scaler.unscale(loss)
-        grads = self.scaler.unscale(grads)
-
-        if self.drop_overflow:
-            status = all_finite(grads)
-            if status:
-                loss = self.update(loss, grads)
-            loss = ops.depend(loss, self.scaler.adjust(status))
-        else:
-            loss = self.update(loss, grads)
-
-        return loss
 
 
 def validate(pipeline, args, trackers, logging_dir, epoch):

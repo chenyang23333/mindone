@@ -111,8 +111,8 @@ def rescale_zero_terminal_snr(betas):
     alphas_bar_sqrt = alphas_cumprod.sqrt()
 
     # Store old values.
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].copy()
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].copy()
 
     # Shift so the last timestep is zero.
     alphas_bar_sqrt -= alphas_bar_sqrt_T
@@ -167,6 +167,9 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             Whether to rescale the betas to have zero terminal SNR. This enables the model to generate very bright and
             dark samples instead of limiting it to samples with medium brightness. Loosely related to
             [`--offset_noise`](https://github.com/huggingface/diffusers/blob/74fd735eb073eb1d774b1ab4154a0876eb82f055/examples/dreambooth/train_dreambooth.py#L506).
+        final_sigmas_type (`str`, defaults to `"zero"`):
+            The final `sigma` value for the noise schedule during the sampling process. If `"sigma_min"`, the final
+            sigma is the same as the last sigma in the training schedule. If `zero`, the final sigma is set to 0.
     """
 
     _compatibles = [e.name for e in KarrasDiffusionSchedulers]
@@ -189,6 +192,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         timestep_type: str = "discrete",  # can be "discrete" or "continuous"
         steps_offset: int = 0,
         rescale_betas_zero_snr: bool = False,
+        final_sigmas_type: str = "zero",  # can be "zero" or "sigma_min"
     ):
         if trained_betas is not None:
             self.betas = ms.tensor(trained_betas, dtype=ms.float32)
@@ -203,7 +207,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
+            raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
         if rescale_betas_zero_snr:
             self.betas = rescale_zero_terminal_snr(self.betas)
@@ -225,7 +229,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         # TODO: Support the full EDM scalings for all prediction types and timestep types
         if timestep_type == "continuous" and prediction_type == "v_prediction":
-            self.timesteps = ms.Tensor([0.25 * sigma.log() for sigma in sigmas])
+            self.timesteps = ms.Tensor([0.25 * sigma.log().item() for sigma in sigmas])
         else:
             self.timesteps = timesteps
 
@@ -290,71 +294,130 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             self._init_step_index(timestep)
 
         sigma = self.sigmas[self.step_index]
-        sample = sample / ((sigma**2 + 1) ** 0.5)
+        sample = (sample / ((sigma**2 + 1) ** 0.5)).to(sample.dtype)
 
         self.is_scale_input_called = True
         return sample
 
-    def set_timesteps(self, num_inference_steps: int):
+    def set_timesteps(
+        self,
+        num_inference_steps: int = None,
+        timesteps: Optional[List[int]] = None,
+        sigmas: Optional[List[float]] = None,
+    ):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
 
         Args:
             num_inference_steps (`int`):
                 The number of diffusion steps used when generating samples with a pre-trained model.
+            timesteps (`List[int]`, *optional*):
+                Custom timesteps used to support arbitrary timesteps schedule. If `None`, timesteps will be generated
+                based on the `timestep_spacing` attribute. If `timesteps` is passed, `num_inference_steps` and `sigmas`
+                must be `None`, and `timestep_spacing` attribute will be ignored.
+            sigmas (`List[float]`, *optional*):
+                Custom sigmas used to support arbitrary timesteps schedule schedule. If `None`, timesteps and sigmas
+                will be generated based on the relevant scheduler attributes. If `sigmas` is passed,
+                `num_inference_steps` and `timesteps` must be `None`, and the timesteps will be generated based on the
+                custom sigmas schedule.
         """
+
+        if timesteps is not None and sigmas is not None:
+            raise ValueError("Only one of `timesteps` or `sigmas` should be set.")
+        if num_inference_steps is None and timesteps is None and sigmas is None:
+            raise ValueError("Must pass exactly one of `num_inference_steps` or `timesteps` or `sigmas.")
+        if num_inference_steps is not None and (timesteps is not None or sigmas is not None):
+            raise ValueError("Can only pass one of `num_inference_steps` or `timesteps` or `sigmas`.")
+        if timesteps is not None and self.config.use_karras_sigmas:
+            raise ValueError("Cannot set `timesteps` with `config.use_karras_sigmas = True`.")
+        if (
+            timesteps is not None
+            and self.config.timestep_type == "continuous"
+            and self.config.prediction_type == "v_prediction"
+        ):
+            raise ValueError(
+                "Cannot set `timesteps` with `config.timestep_type = 'continuous'` and `config.prediction_type = 'v_prediction'`."
+            )
+
+        if num_inference_steps is None:
+            num_inference_steps = len(timesteps) if timesteps is not None else len(sigmas) - 1
         self.num_inference_steps = num_inference_steps
 
-        # "linspace", "leading", "trailing" corresponds to annotation of Table 2. of https://arxiv.org/abs/2305.08891
-        if self.config.timestep_spacing == "linspace":
-            timesteps = np.linspace(0, self.config.num_train_timesteps - 1, num_inference_steps, dtype=np.float32)[
-                ::-1
-            ].copy()
-        elif self.config.timestep_spacing == "leading":
-            step_ratio = self.config.num_train_timesteps // self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.float32)
-            timesteps += self.config.steps_offset
-        elif self.config.timestep_spacing == "trailing":
-            step_ratio = self.config.num_train_timesteps / self.num_inference_steps
-            # creates integer timesteps by multiplying by ratio
-            # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (np.arange(self.config.num_train_timesteps, 0, -step_ratio)).round().copy().astype(np.float32)
-            timesteps -= 1
+        if sigmas is not None:
+            log_sigmas = np.log(np.array(((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5))
+            sigmas = np.array(sigmas).astype(np.float32)
+            timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas[:-1]])
+
         else:
-            raise ValueError(
-                f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'linspace', 'leading' or 'trailing'."
-            )
+            if timesteps is not None:
+                timesteps = np.array(timesteps).astype(np.float32)
+            else:
+                # "linspace", "leading", "trailing" corresponds to annotation of Table 2. of https://arxiv.org/abs/2305.08891
+                if self.config.timestep_spacing == "linspace":
+                    timesteps = np.linspace(
+                        0, self.config.num_train_timesteps - 1, num_inference_steps, dtype=np.float32
+                    )[::-1].copy()
+                elif self.config.timestep_spacing == "leading":
+                    step_ratio = self.config.num_train_timesteps // self.num_inference_steps
+                    # creates integer timesteps by multiplying by ratio
+                    # casting to int to avoid issues when num_inference_step is power of 3
+                    timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.float32)
+                    timesteps += self.config.steps_offset
+                elif self.config.timestep_spacing == "trailing":
+                    step_ratio = self.config.num_train_timesteps / self.num_inference_steps
+                    # creates integer timesteps by multiplying by ratio
+                    # casting to int to avoid issues when num_inference_step is power of 3
+                    timesteps = (
+                        (np.arange(self.config.num_train_timesteps, 0, -step_ratio)).round().copy().astype(np.float32)
+                    )
+                    timesteps -= 1
+                else:
+                    raise ValueError(
+                        f"{self.config.timestep_spacing} is not supported. Please make sure to choose one of 'linspace', 'leading' or 'trailing'."
+                    )
 
-        sigmas = np.array(((1 - self.alphas_cumprod.numpy()) / self.alphas_cumprod.numpy()) ** 0.5)
-        log_sigmas = np.log(sigmas)
+            sigmas = (((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5).asnumpy()
+            log_sigmas = np.log(sigmas)
 
-        if self.config.interpolation_type == "linear":
-            sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
-        elif self.config.interpolation_type == "log_linear":
-            sigmas = np.linspace(np.log(sigmas[-1]), np.log(sigmas[0]), num_inference_steps + 1).exp()
-        else:
-            raise ValueError(
-                f"{self.config.interpolation_type} is not implemented. Please specify interpolation_type to either"
-                " 'linear' or 'log_linear'"
-            )
+            if self.config.interpolation_type == "linear":
+                sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
+            elif self.config.interpolation_type == "log_linear":
+                sigmas = np.exp(np.linspace(np.log(sigmas[-1]), np.log(sigmas[0]), num_inference_steps + 1))
+            else:
+                raise ValueError(
+                    f"{self.config.interpolation_type} is not implemented. Please specify interpolation_type to either"
+                    " 'linear' or 'log_linear'"
+                )
 
-        if self.use_karras_sigmas:
-            sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=self.num_inference_steps)
-            timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas])
+            if self.config.use_karras_sigmas:
+                sigmas = self._convert_to_karras(in_sigmas=sigmas, num_inference_steps=self.num_inference_steps)
+                timesteps = np.array([self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas])
+
+            if self.config.final_sigmas_type == "sigma_min":
+                sigma_last = ((1 - self.alphas_cumprod[0]) / self.alphas_cumprod[0]) ** 0.5
+                sigma_last = (
+                    sigma_last.asnumpy()
+                )  # Transform for numpy concatenate where Torch tensor could be concated with numpy array directly
+            elif self.config.final_sigmas_type == "zero":
+                sigma_last = 0
+            else:
+                raise ValueError(
+                    f"`final_sigmas_type` must be one of 'zero', or 'sigma_min', but got {self.config.final_sigmas_type}"
+                )
+
+            sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
         sigmas = ms.Tensor(sigmas).to(dtype=ms.float32)
 
         # TODO: Support the full EDM scalings for all prediction types and timestep types
         if self.config.timestep_type == "continuous" and self.config.prediction_type == "v_prediction":
-            self.timesteps = ms.Tensor([0.25 * sigma.log() for sigma in sigmas])
+            self.timesteps = ms.Tensor([0.25 * sigma.log().item() for sigma in sigmas[:-1]])
         else:
             self.timesteps = ms.Tensor(timesteps.astype(np.float32))
 
-        self.sigmas = ops.cat([sigmas, ops.zeros(1)])
         self._step_index = None
         self._begin_index = None
+        self.sigmas = sigmas
 
     def _sigma_to_t(self, sigma, log_sigmas):
         # get log sigma
@@ -409,15 +472,18 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         if schedule_timesteps is None:
             schedule_timesteps = self.timesteps
 
-        indices = (schedule_timesteps == timestep).nonzero()
+        if (schedule_timesteps == timestep).sum() > 1:
+            pos = 1
+        else:
+            pos = 0
 
         # The sigma index that is taken for the **very** first `step`
         # is always the second index (or the last index if there is only 1)
         # This way we can ensure we don't accidentally skip a sigma in
         # case we start in the middle of the denoising schedule (e.g. for image-to-image)
-        pos = 1 if len(indices) > 1 else 0
+        indices = (schedule_timesteps == timestep).nonzero()
 
-        return indices[pos].item()
+        return int(indices[pos])
 
     def _init_step_index(self, timestep):
         if self.begin_index is None:
@@ -504,10 +570,12 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         if self.config.prediction_type == "original_sample" or self.config.prediction_type == "sample":
             pred_original_sample = model_output
         elif self.config.prediction_type == "epsilon":
-            pred_original_sample = sample - sigma_hat * model_output
+            pred_original_sample = sample - sigma_hat.to(model_output.dtype) * model_output
         elif self.config.prediction_type == "v_prediction":
             # denoised = model_output * c_out + input * c_skip
-            pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
+            pred_original_sample = (model_output * (-sigma / (sigma**2 + 1) ** 0.5)).to(model_output.dtype) + (
+                sample / (sigma**2 + 1)
+            )
         else:
             raise ValueError(
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, or `v_prediction`"
@@ -537,6 +605,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         noise: ms.Tensor,
         timesteps: ms.Tensor,
     ) -> ms.Tensor:
+        broadcast_shape = original_samples.shape
         # Make sure sigmas and timesteps have the same device and dtype as original_samples
         sigmas = self.sigmas.to(dtype=original_samples.dtype)
         schedule_timesteps = self.timesteps
@@ -548,11 +617,39 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             step_indices = [self.begin_index] * timesteps.shape[0]
 
         sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < len(original_samples.shape):
-            sigma = sigma.unsqueeze(-1)
+        # while len(sigma.shape) < len(original_samples.shape):
+        #     sigma = sigma.unsqueeze(-1)
+        sigma = ops.reshape(sigma, (timesteps.shape[0],) + (1,) * (len(broadcast_shape) - 1))
 
         noisy_samples = original_samples + noise * sigma
         return noisy_samples
+
+    def get_velocity(self, sample: ms.Tensor, noise: ms.Tensor, timesteps: ms.Tensor) -> ms.Tensor:
+        if isinstance(timesteps, int) or (isinstance(timesteps, ms.Tensor) and timesteps.dtype in [ms.int32, ms.int64]):
+            raise ValueError(
+                (
+                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
+                    " `EulerDiscreteScheduler.get_velocity()` is not supported. Make sure to pass"
+                    " one of the `scheduler.timesteps` as a timestep."
+                ),
+            )
+
+        schedule_timesteps = self.timesteps
+
+        step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in timesteps]
+        alphas_cumprod = self.alphas_cumprod.to(sample.dtype)
+        sqrt_alpha_prod = alphas_cumprod[step_indices] ** 0.5
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+        while len(sqrt_alpha_prod.shape) < len(sample.shape):
+            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[step_indices]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+        velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
+        return velocity
 
     def __len__(self):
         return self.config.num_train_timesteps

@@ -83,7 +83,7 @@ def betas_for_alpha_bar(
             return math.exp(t * -12.0)
 
     else:
-        raise ValueError(f"Unsupported alpha_tranform_type: {alpha_transform_type}")
+        raise ValueError(f"Unsupported alpha_transform_type: {alpha_transform_type}")
 
     betas = []
     for i in range(num_diffusion_timesteps):
@@ -111,8 +111,8 @@ def rescale_zero_terminal_snr(betas):
     alphas_bar_sqrt = alphas_cumprod.sqrt()
 
     # Store old values.
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].copy()
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].copy()
 
     # Shift so the last timestep is zero.
     alphas_bar_sqrt -= alphas_bar_sqrt_T
@@ -214,7 +214,7 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
         else:
-            raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
+            raise NotImplementedError(f"{beta_schedule} is not implemented for {self.__class__}")
 
         # Rescale for zero SNR
         if rescale_betas_zero_snr:
@@ -281,11 +281,11 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
             sample = sample.float()  # upcast for quantile calculation, and clamp not implemented for cpu half
 
         # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims).item())
 
         abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
 
-        s = ops.quantile(abs_sample, self.config.dynamic_thresholding_ratio, axis=1)
+        s = ms.Tensor.from_numpy(np.quantile(abs_sample.asnumpy(), self.config.dynamic_thresholding_ratio, axis=1))
         s = ops.clamp(
             s, min=1, max=self.config.sample_max_value
         )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
@@ -401,6 +401,7 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         # - pred_sample_direction -> "direction pointing to x_t"
         # - pred_prev_sample -> "x_t-1"
 
+        dtype = sample.dtype
         # 1. get previous step value (=t-1)
         prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
 
@@ -413,14 +414,20 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         # 3. compute predicted original sample from predicted noise also called
         # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
         if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_original_sample = (
+                (sample - (beta_prod_t ** (0.5)).to(dtype) * model_output) / alpha_prod_t ** (0.5)
+            ).to(dtype)
             pred_epsilon = model_output
         elif self.config.prediction_type == "sample":
             pred_original_sample = model_output
-            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+            pred_epsilon = (
+                (sample - (alpha_prod_t ** (0.5)).to(dtype) * pred_original_sample) / beta_prod_t ** (0.5)
+            ).to(dtype)
         elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-            pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+            pred_original_sample = (alpha_prod_t**0.5).to(dtype) * sample - (beta_prod_t**0.5).to(
+                dtype
+            ) * model_output
+            pred_epsilon = (alpha_prod_t**0.5).to(dtype) * model_output + (beta_prod_t**0.5).to(dtype) * sample
         else:
             raise ValueError(
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
@@ -438,17 +445,19 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         # 5. compute variance: "sigma_t(η)" -> see formula (16)
         # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
         variance = self._get_variance(timestep, prev_timestep)
-        std_dev_t = eta * variance ** (0.5)
+        std_dev_t = (eta * variance ** (0.5)).to(dtype)
 
         if use_clipped_model_output:
             # the pred_epsilon is always re-derived from the clipped x_0 in Glide
-            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+            pred_epsilon = (
+                (sample - (alpha_prod_t ** (0.5)).to(dtype) * pred_original_sample) / beta_prod_t ** (0.5)
+            ).to(dtype)
 
         # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * pred_epsilon
+        pred_sample_direction = ((1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5)).to(dtype) * pred_epsilon
 
         # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+        prev_sample = (alpha_prod_t_prev ** (0.5)).to(dtype) * pred_original_sample + pred_sample_direction
 
         if eta > 0:
             if variance_noise is not None and generator is not None:
@@ -458,7 +467,7 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
                 )
 
             if variance_noise is None:
-                variance_noise = randn_tensor(model_output.shape, generator=generator, dtype=model_output.dtype)
+                variance_noise = randn_tensor(model_output.shape, generator=generator, dtype=dtype)
             variance = std_dev_t * variance_noise
 
             prev_sample = prev_sample + variance
@@ -479,21 +488,22 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
         # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
         # for the subsequent add_noise calls
-        self.alphas_cumprod = self.alphas_cumprod
         alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
 
         sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
         sqrt_alpha_prod = sqrt_alpha_prod.flatten()
         # while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
         #     sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-        sqrt_alpha_prod = ops.reshape(sqrt_alpha_prod, (timesteps.shape[0],) + (1,) * (len(broadcast_shape) - 1))
+        sqrt_alpha_prod = ops.reshape(
+            sqrt_alpha_prod, (timesteps.reshape((-1,)).shape[0],) + (1,) * (len(broadcast_shape) - 1)
+        )
 
         sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
         sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
         # while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
         #     sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
         sqrt_one_minus_alpha_prod = ops.reshape(
-            sqrt_one_minus_alpha_prod, (timesteps.shape[0],) + (1,) * (len(broadcast_shape) - 1)
+            sqrt_one_minus_alpha_prod, (timesteps.reshape((-1,)).shape[0],) + (1,) * (len(broadcast_shape) - 1)
         )
 
         noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
@@ -502,18 +512,22 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler.get_velocity
     def get_velocity(self, sample: ms.Tensor, noise: ms.Tensor, timesteps: ms.Tensor) -> ms.Tensor:
         # Make sure alphas_cumprod and timestep have same device and dtype as sample
-        self.alphas_cumprod = self.alphas_cumprod
+        broadcast_shape = sample.shape
         alphas_cumprod = self.alphas_cumprod.to(dtype=sample.dtype)
 
         sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
         sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(sample.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        # while len(sqrt_alpha_prod.shape) < len(sample.shape):
+        #     sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+        sqrt_alpha_prod = ops.reshape(sqrt_alpha_prod, (timesteps.shape[0],) + (1,) * (len(broadcast_shape) - 1))
 
         sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
         sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        # while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
+        #     sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+        sqrt_one_minus_alpha_prod = ops.reshape(
+            sqrt_one_minus_alpha_prod, (timesteps.shape[0],) + (1,) * (len(broadcast_shape) - 1)
+        )
 
         velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
         return velocity

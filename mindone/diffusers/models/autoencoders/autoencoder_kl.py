@@ -11,18 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
+
+import numpy as np
 
 import mindspore as ms
-from mindspore import nn
+from mindspore import nn, ops
 
 from ...configuration_utils import ConfigMixin, register_to_config
+from ...loaders import FromOriginalModelMixin
+from ..attention_processor import CROSS_ATTENTION_PROCESSORS, AttentionProcessor, AttnProcessor
 from ..modeling_outputs import AutoencoderKLOutput
 from ..modeling_utils import ModelMixin
 from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
 
 
-class AutoencoderKL(ModelMixin, ConfigMixin):
+class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -55,6 +59,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
     """
 
     _supports_gradient_checkpointing = True
+    _no_split_modules = ["BasicTransformerBlock", "ResnetBlock2D"]
 
     @register_to_config
     def __init__(
@@ -70,9 +75,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         norm_num_groups: int = 32,
         sample_size: int = 32,
         scaling_factor: float = 0.18215,
+        shift_factor: Optional[float] = None,
         force_upcast: float = True,
         latents_mean: Optional[Tuple[float]] = None,
         latents_std: Optional[Tuple[float]] = None,
+        use_quant_conv: bool = True,
+        use_post_quant_conv: bool = True,
     ):
         super().__init__()
 
@@ -99,8 +107,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             act_fn=act_fn,
         )
 
-        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1, has_bias=True)
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1, has_bias=True)
+        self.quant_conv = (
+            nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1, has_bias=True) if use_quant_conv else None
+        )
+        self.post_quant_conv = (
+            nn.Conv2d(latent_channels, latent_channels, 1, has_bias=True) if use_post_quant_conv else None
+        )
         self.diag_gauss_dist = DiagonalGaussianDistribution()
 
         self.use_slicing = False
@@ -116,6 +128,113 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
         self.tile_overlap_factor = 0.25
 
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, (Encoder, Decoder)):
+            module.gradient_checkpointing = value
+
+    def enable_tiling(self, use_tiling: bool = True):
+        r"""
+        Enable tiled VAE decoding. When this option is enabled, the VAE will split the input tensor into tiles to
+        compute decoding and encoding in several steps. This is useful for saving a large amount of memory and to allow
+        processing larger images.
+        """
+        self.use_tiling = use_tiling
+
+    def disable_tiling(self):
+        r"""
+        Disable tiled VAE decoding. If `enable_tiling` was previously enabled, this method will go back to computing
+        decoding in one step.
+        """
+        self.enable_tiling(False)
+
+    def enable_slicing(self):
+        r"""
+        Enable sliced VAE decoding. When this option is enabled, the VAE will split the input tensor in slices to
+        compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
+        """
+        self.use_slicing = True
+
+    def disable_slicing(self):
+        r"""
+        Disable sliced VAE decoding. If `enable_slicing` was previously enabled, this method will go back to computing
+        decoding in one step.
+        """
+        self.use_slicing = False
+
+    @property
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
+    def attn_processors(self) -> Dict[str, AttentionProcessor]:
+        r"""
+        Returns:
+            `dict` of attention processors: A dictionary containing all attention processors used in the model with
+            indexed by its weight name.
+        """
+        # set recursively
+        processors = {}
+
+        def fn_recursive_add_processors(name: str, module: nn.Cell, processors: Dict[str, AttentionProcessor]):
+            if hasattr(module, "get_processor"):
+                processors[f"{name}.processor"] = module.get_processor()
+
+            for sub_name, child in module.name_cells().items():
+                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
+
+            return processors
+
+        for name, module in self.name_cells().items():
+            fn_recursive_add_processors(name, module, processors)
+
+        return processors
+
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
+    def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
+        r"""
+        Sets the attention processor to use to compute attention.
+
+        Parameters:
+            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
+                The instantiated processor class or a dictionary of processor classes that will be set as the processor
+                for **all** `Attention` layers.
+
+                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
+                processor. This is strongly recommended when setting trainable attention processors.
+
+        """
+        count = len(self.attn_processors.keys())
+
+        if isinstance(processor, dict) and len(processor) != count:
+            raise ValueError(
+                f"A dict of processors was passed, but the number of processors {len(processor)} does not match the"
+                f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
+            )
+
+        def fn_recursive_attn_processor(name: str, module: nn.Cell, processor):
+            if hasattr(module, "set_processor"):
+                if not isinstance(processor, dict):
+                    module.set_processor(processor)
+                else:
+                    module.set_processor(processor.pop(f"{name}.processor"))
+
+            for sub_name, child in module.name_cells().items():
+                fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
+
+        for name, module in self.name_cells().items():
+            fn_recursive_attn_processor(name, module, processor)
+
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_default_attn_processor
+    def set_default_attn_processor(self):
+        """
+        Disables custom attention processors and sets the default attention implementation.
+        """
+        if all(proc.__class__ in CROSS_ATTENTION_PROCESSORS for proc in self.attn_processors.values()):
+            processor = AttnProcessor()
+        else:
+            raise ValueError(
+                f"Cannot call `set_default_attn_processor` when attention processors are of type {next(iter(self.attn_processors.values()))}"
+            )
+
+        self.set_attn_processor(processor)
+
     def encode(self, x: ms.Tensor, return_dict: bool = False) -> Union[AutoencoderKLOutput, Tuple[ms.Tensor]]:
         """
         Encode a batch of images into latents.
@@ -129,9 +248,19 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
                 The latent representations of the encoded images. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
-        h = self.encoder(x)
+        if self.use_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
+            return self.tiled_encode(x, return_dict=return_dict)
 
-        moments = self.quant_conv(h)
+        if self.use_slicing and x.shape[0] > 1:
+            encoded_slices = [self.encoder(x_slice) for x_slice in x.split(1)]
+            h = ops.cat(encoded_slices)
+        else:
+            h = self.encoder(x)
+
+        if self.quant_conv is not None:
+            moments = self.quant_conv(h)
+        else:
+            moments = h
         # we cannot use class in graph mode, even for jit_class or subclass of Tensor. :-(
         # posterior = DiagonalGaussianDistribution(moments)
 
@@ -141,7 +270,11 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         return AutoencoderKLOutput(latent=moments)
 
     def _decode(self, z: ms.Tensor, return_dict: bool = False) -> Union[DecoderOutput, Tuple[ms.Tensor]]:
-        z = self.post_quant_conv(z)
+        if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size):
+            return self.tiled_decode(z, return_dict=return_dict)
+
+        if self.post_quant_conv is not None:
+            z = self.post_quant_conv(z)
         dec = self.decoder(z)
 
         if not return_dict:
@@ -149,7 +282,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
 
         return DecoderOutput(sample=dec)
 
-    def decode(self, z: ms.Tensor, return_dict: bool = False) -> Union[DecoderOutput, Tuple[ms.Tensor]]:
+    def decode(self, z: ms.Tensor, return_dict: bool = False, generator=None) -> Union[DecoderOutput, Tuple[ms.Tensor]]:
         """
         Decode a batch of images.
 
@@ -164,18 +297,136 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
                 returned.
 
         """
-        decoded = self._decode(z)[0]
+        if self.use_slicing and z.shape[0] > 1:
+            decoded_slices = [self._decode(z_slice)[0] for z_slice in z.split(1)]
+            decoded = ops.cat(decoded_slices)
+        else:
+            decoded = self._decode(z)[0]
 
         if not return_dict:
             return (decoded,)
 
         return DecoderOutput(sample=decoded)
 
+    def blend_v(self, a: ms.Tensor, b: ms.Tensor, blend_extent: int) -> ms.Tensor:
+        blend_extent = min(a.shape[2], b.shape[2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
+        return b
+
+    def blend_h(self, a: ms.Tensor, b: ms.Tensor, blend_extent: int) -> ms.Tensor:
+        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (x / blend_extent)
+        return b
+
+    def tiled_encode(self, x: ms.Tensor, return_dict: bool = False) -> AutoencoderKLOutput:
+        r"""Encode a batch of images using a tiled encoder.
+
+        When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
+        steps. This is useful to keep memory use constant regardless of image size. The end result of tiled encoding is
+        different from non-tiled encoding because each tile uses a different encoder. To avoid tiling artifacts, the
+        tiles overlap and are blended together to form a smooth output. You may still see tile-sized changes in the
+        output, but they should be much less noticeable.
+
+        Args:
+            x (`ms.Tensor`): Input batch of images.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.autoencoder_kl.AutoencoderKLOutput`] instead of a plain tuple.
+
+        Returns:
+            [`~models.autoencoder_kl.AutoencoderKLOutput`] or `tuple`:
+                If return_dict is True, a [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain
+                `tuple` is returned.
+        """
+        overlap_size = int(self.tile_sample_min_size * (1 - self.tile_overlap_factor))
+        blend_extent = int(self.tile_latent_min_size * self.tile_overlap_factor)
+        row_limit = self.tile_latent_min_size - blend_extent
+
+        # Split the image into 512x512 tiles and encode them separately.
+        rows = []
+        for i in range(0, x.shape[2], overlap_size):
+            row = []
+            for j in range(0, x.shape[3], overlap_size):
+                tile = x[:, :, i : i + self.tile_sample_min_size, j : j + self.tile_sample_min_size]
+                tile = self.encoder(tile)
+                tile = self.quant_conv(tile)
+                row.append(tile)
+            rows.append(row)
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :row_limit, :row_limit])
+            result_rows.append(ops.cat(result_row, axis=3))
+
+        moments = ops.cat(result_rows, axis=2)
+
+        if not return_dict:
+            return (moments,)
+
+        return AutoencoderKLOutput(latent=moments)
+
+    def tiled_decode(self, z: ms.Tensor, return_dict: bool = False) -> Union[DecoderOutput, ms.Tensor]:
+        r"""
+        Decode a batch of images using a tiled decoder.
+
+        Args:
+            z (`ms.Tensor`): Input batch of latent vectors.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
+
+        Returns:
+            [`~models.vae.DecoderOutput`] or `tuple`:
+                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
+                returned.
+        """
+        overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
+        blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)
+        row_limit = self.tile_sample_min_size - blend_extent
+
+        # Split z into overlapping 64x64 tiles and decode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
+        rows = []
+        for i in range(0, z.shape[2], overlap_size):
+            row = []
+            for j in range(0, z.shape[3], overlap_size):
+                tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size]
+                tile = self.post_quant_conv(tile)
+                decoded = self.decoder(tile)
+                row.append(decoded)
+            rows.append(row)
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :row_limit, :row_limit])
+            result_rows.append(ops.cat(result_row, axis=3))
+
+        dec = ops.cat(result_rows, axis=2)
+        if not return_dict:
+            return (dec,)
+
+        return DecoderOutput(sample=dec)
+
     def construct(
         self,
         sample: ms.Tensor,
         sample_posterior: bool = False,
         return_dict: bool = False,
+        generator: Optional[np.random.Generator] = None,
     ) -> Union[DecoderOutput, Tuple[ms.Tensor]]:
         r"""
         Args:
@@ -188,7 +439,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         x = sample
         latent = self.encode(x)[0]
         if sample_posterior:
-            z = self.diag_gauss_dist.sample(latent)
+            z = self.diag_gauss_dist.sample(latent, generator=generator)
         else:
             z = self.diag_gauss_dist.mode(latent)
         dec = self.decode(z)[0]
