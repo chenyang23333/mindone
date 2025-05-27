@@ -15,9 +15,12 @@
 """PyTorch AyaVision model."""
 
 from typing import List, Optional, Tuple, Union
-
-import torch
-from torch import nn
+#
+# import torch
+# from torch import nn
+import mindspore as ms
+from mindspore import nn, ops
+from mindspore.common.initializer import Normal, initializer
 
 from transformers.models.llava.modeling_llava import (
     KwargsForCausalLM,
@@ -36,7 +39,7 @@ from .configuration_aya_vision import AyaVisionConfig
 logger = logging.get_logger(__name__)
 
 
-class AyaVisionMultiModalProjector(nn.Module):
+class AyaVisionMultiModalProjector(nn.Cell):
     def __init__(self, config: AyaVisionConfig):
         super().__init__()
         self.config = config
@@ -48,7 +51,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             config.vision_config.hidden_size * (config.downsample_factor**2), eps=config.adapter_layer_norm_eps
         )
 
-        self.linear_1 = nn.Linear(
+        self.linear_1 = nn.Dense(
             config.vision_config.hidden_size * (config.downsample_factor**2),
             self.alignment_intermediate_size,
             bias=True,
@@ -56,9 +59,9 @@ class AyaVisionMultiModalProjector(nn.Module):
 
         self.act = ACT2FN["silu"]  # SwiGLU uses SiLU activation
         # For SwiGLU, project down to half size since we split intermediate dim
-        self.linear_2 = nn.Linear(self.alignment_intermediate_size // 2, config.text_config.hidden_size, bias=True)
+        self.linear_2 = nn.Dense(self.alignment_intermediate_size // 2, config.text_config.hidden_size, bias=True)
 
-    def forward(self, image_features):
+    def construct(self, image_features):
         image_features = self.pixel_shuffle(image_features)
         image_features = self.layernorm(image_features)
         hidden_states = self.linear_1(image_features)
@@ -90,20 +93,20 @@ class AyaVisionPreTrainedModel(LlavaPreTrainedModel):
     _supports_quantized_cache = False
     _supports_static_cache = False
 
-    def _init_weights(self, module):
+    def _init_weights(self, cell):
         std = (
             self.config.initializer_range
             if hasattr(self.config, "initializer_range")
             else self.config.text_config.initializer_range
         )
 
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
-            module.bias.data.zero_()
+        if isinstance(cell, nn.Dense):
+            cell.weight.data.normal_(mean=0.0, std=std)
+            if cell.bias is not None:
+                cell.bias.data.zero_()
+        elif isinstance(cell, nn.LayerNorm):
+            cell.weight.data.fill_(1.0)
+            cell.bias.data.zero_()
 
 
 class AyaVisionCausalLMOutputWithPast(LlavaCausalLMOutputWithPast):
@@ -115,24 +118,24 @@ class AyaVisionModel(LlavaModel):
 
 
 class AyaVisionForConditionalGeneration(LlavaForConditionalGeneration):
-    def forward(
+    def construct(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[ms.Tensor] = None,
+        pixel_values: Optional[ms.Tensor] = None,
+        attention_mask: Optional[ms.Tensor] = None,
+        position_ids: Optional[ms.Tensor] = None,
+        past_key_values: Optional[List[ms.Tensor]] = None,
+        inputs_embeds: Optional[ms.Tensor] = None,
         vision_feature_layer: Optional[Union[int, List[int]]] = None,
         vision_feature_select_strategy: Optional[str] = None,
-        labels: Optional[torch.LongTensor] = None,
+        labels: Optional[ms.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        image_sizes: Optional[torch.Tensor] = None,
+        cache_position: Optional[ms.Tensor] = None,
+        logits_to_keep: Union[int, ms.Tensor] = 0,
+        image_sizes: Optional[ms.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, AyaVisionCausalLMOutputWithPast]:
         r"""
@@ -171,7 +174,7 @@ class AyaVisionForConditionalGeneration(LlavaForConditionalGeneration):
         >>> gen_tokens = model.generate(**inputs, max_new_tokens=300, do_sample=True, temperature=0.3)
         >>> processor.tokenizer.decode(gen_tokens[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
         ```"""
-        super().forward(
+        super().construct(
             input_ids=input_ids,
             pixel_values=pixel_values,
             attention_mask=attention_mask,

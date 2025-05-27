@@ -3,8 +3,13 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
-import torch
-from torch import nn
+# import torch
+# from torch import nn
+
+import mindspore as ms
+from mindspore import nn, ops
+from mindspore.common.initializer import Normal, initializer
+
 
 from ...activations import ACT2FN
 from ...generation import GenerationMixin
@@ -17,7 +22,7 @@ from ..auto import AutoModel
 from .configuration_aya_vision import AyaVisionConfig
 
 
-class AyaVisionMultiModalProjector(nn.Module):
+class AyaVisionMultiModalProjector(nn.cell):
     def __init__(self, config: AyaVisionConfig):
         super().__init__()
         self.config = config
@@ -29,7 +34,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             config.vision_config.hidden_size * (config.downsample_factor**2), eps=config.adapter_layer_norm_eps
         )
 
-        self.linear_1 = nn.Linear(
+        self.linear_1 = nn.Dense(
             config.vision_config.hidden_size * (config.downsample_factor**2),
             self.alignment_intermediate_size,
             bias=True,
@@ -37,9 +42,9 @@ class AyaVisionMultiModalProjector(nn.Module):
 
         self.act = ACT2FN["silu"]  # SwiGLU uses SiLU activation
         # For SwiGLU, project down to half size since we split intermediate dim
-        self.linear_2 = nn.Linear(self.alignment_intermediate_size // 2, config.text_config.hidden_size, bias=True)
+        self.linear_2 = nn.Dense(self.alignment_intermediate_size // 2, config.text_config.hidden_size, bias=True)
 
-    def forward(self, image_features):
+    def construct(self, image_features):
         image_features = self.pixel_shuffle(image_features)
         image_features = self.layernorm(image_features)
         hidden_states = self.linear_1(image_features)
@@ -80,20 +85,20 @@ class AyaVisionPreTrainedModel(PreTrainedModel):
     _supports_static_cache = False
     _supports_attention_backend = True
 
-    def _init_weights(self, module):
+    def _init_weights(self, cell):
         std = (
             self.config.initializer_range
             if hasattr(self.config, "initializer_range")
             else self.config.text_config.initializer_range
         )
 
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
-            module.bias.data.zero_()
+        if isinstance(cell, nn.Dense):
+            cell.weight.data.normal_(mean=0.0, std=std)
+            if cell.bias is not None:
+                cell.bias.data.zero_()
+        elif isinstance(cell, nn.LayerNorm):
+            cell.weight.data.fill_(1.0)
+            cell.bias.data.zero_()
 
 
 @dataclass
@@ -128,12 +133,12 @@ class AyaVisionCausalLMOutputWithPast(ModelOutput):
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[List[torch.FloatTensor]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-    image_hidden_states: Optional[torch.FloatTensor] = None
+    loss: Optional[ms.Tensor] = None
+    logits: Optional[ms.Tensor] = None
+    past_key_values: Optional[List[ms.Tensor]] = None
+    hidden_states: Optional[Tuple[ms.Tensor]] = None
+    attentions: Optional[Tuple[ms.Tensor]] = None
+    image_hidden_states: Optional[ms.Tensor] = None
 
 
 @dataclass
@@ -166,7 +171,7 @@ class AyaVisionModelOutputWithPast(BaseModelOutputWithPast):
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    image_hidden_states: Optional[torch.FloatTensor] = None
+    image_hidden_states: Optional[ms.Tensor] = None
 
 
 @auto_docstring(
@@ -193,7 +198,7 @@ class AyaVisionModel(AyaVisionPreTrainedModel):
 
     def get_image_features(
         self,
-        pixel_values: torch.FloatTensor,
+        pixel_values: ms.Tensor,
         vision_feature_layer: Optional[Union[int, List[int]]] = None,
         vision_feature_select_strategy: Optional[str] = None,
         **kwargs,
@@ -241,29 +246,29 @@ class AyaVisionModel(AyaVisionPreTrainedModel):
             # For default; crop CLS from each hidden state in the hidden state pool
             if vision_feature_select_strategy == "default":
                 hs_pool = [hs[:, 1:] for hs in hs_pool]
-            selected_image_feature = torch.cat(hs_pool, dim=-1)
+            selected_image_feature = ms.ops.cat(hs_pool, dim=-1)
 
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
 
     @can_return_tuple
     @auto_docstring
-    def forward(
+    def construct(
         self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        input_ids: ms.Tensor = None,
+        pixel_values: ms.FloatTensor = None,
+        attention_mask: Optional[ms.Tensor] = None,
+        position_ids: Optional[ms.Tensor] = None,
+        past_key_values: Optional[List[ms.Tensor]] = None,
+        inputs_embeds: Optional[ms.Tensor] = None,
         vision_feature_layer: Optional[Union[int, List[int]]] = None,
         vision_feature_select_strategy: Optional[str] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        image_sizes: torch.Tensor = None,
+        cache_position: Optional[ms.Tensor] = None,
+        image_sizes: ms.Tensor = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, AyaVisionModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -296,7 +301,7 @@ class AyaVisionModel(AyaVisionPreTrainedModel):
 
             if input_ids is None:
                 special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                    torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+                    ms.tensor(self.config.image_token_id, dtype=ms.int64, device=inputs_embeds.device)
                 )
                 n_image_tokens = (special_image_mask).sum(dim=1).sum(dim=0)[0]
             else:
@@ -385,24 +390,24 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
 
     @can_return_tuple
     @auto_docstring
-    def forward(
+    def construct(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[ms.Tensor] = None,
+        pixel_values: Optional[ms.Tensor] = None,
+        attention_mask: Optional[ms.Tensor] = None,
+        position_ids: Optional[ms.Tensor] = None,
+        past_key_values: Optional[List[ms.Tensor]] = None,
+        inputs_embeds: Optional[ms.Tensor] = None,
         vision_feature_layer: Optional[Union[int, List[int]]] = None,
         vision_feature_select_strategy: Optional[str] = None,
-        labels: Optional[torch.LongTensor] = None,
+        labels: Optional[ms.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        image_sizes: Optional[torch.Tensor] = None,
+        cache_position: Optional[ms.Tensor] = None,
+        logits_to_keep: Union[int, ms.Tensor] = 0,
+        image_sizes: Optional[ms.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, AyaVisionCausalLMOutputWithPast]:
         r"""
@@ -415,11 +420,9 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
 
         ```python
         >>> from transformers import AutoProcessor, AyaVisionForConditionalGeneration
-        >>> import torch
 
-        >>> torch_device = "cuda:0"
         >>> processor = AutoProcessor.from_pretrained("CohereForAI/aya-vision-8b", use_fast=True)
-        >>> model = AyaVisionForConditionalGeneration.from_pretrained("CohereForAI/aya-vision-8b", device_map=torch_device)
+        >>> model = AyaVisionForConditionalGeneration.from_pretrained("CohereForAI/aya-vision-8b")
 
         >>> messages = [
         ...     {
@@ -525,11 +528,11 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
+        attention_mask: ms.Tensor,
         sequence_length: int,
         target_length: int,
-        dtype: torch.dtype,
-        cache_position: torch.Tensor,
+        dtype: ms.dtype,
+        cache_position: ms.Tensor,
         batch_size: int,
         **kwargs,
     ):
@@ -557,13 +560,26 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            min_dtype = ms.common.dtype.finfo
+            # causal_mask = torch.full(
+            #     (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            # )
+            causal_mask = ops.fill(
+                dtype,  # 直接传入 dtype，例如 ms.float32
+                (sequence_length, target_length),
+                min_dtype  # 最小值，例如 finfo(dtype).min
             )
+
+            # if sequence_length != 1:
+            #     causal_mask = torch.triu(causal_mask, diagonal=1)
+            # causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
             if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+                causal_mask = ops.triu(causal_mask, diagonal=1)  # 上三角矩阵
+
+            # 生成位置比较掩码（替代 torch.arange > cache_position）
+            pos_mask = ops.arange(target_length) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask * pos_mask  # 逐元素乘法
+
             causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
             if attention_mask is not None:
                 causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
