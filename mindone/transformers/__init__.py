@@ -195,3 +195,6 @@ from .models.whisper import (
 from .models.xlm_roberta import XLMRobertaModel, XLMRobertaPreTrainedModel
 from .pipelines import TextGenerationPipeline, pipeline
 from .processing_utils import ProcessorMixin
+
+
+from .models.aya_vision import *
