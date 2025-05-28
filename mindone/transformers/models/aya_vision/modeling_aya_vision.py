@@ -359,8 +359,10 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
 
     def __init__(self, config: AyaVisionConfig):
         super().__init__(config)
+        breakpoint()
+        print("AyaVisionForConditionalGeneration ms inner")
         self.model = AyaVisionModel(config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.lm_head = nn.Dense(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 
     def get_input_embeddings(self):
