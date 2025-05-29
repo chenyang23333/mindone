@@ -599,4 +599,6 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
 __all__ = ["AyaVisionForConditionalGeneration", "AyaVisionPreTrainedModel", "AyaVisionModel"]
 
 
-
+if __name__ == "__main__":
+    print("hello world")
+    model = AyaVisionForConditionalGeneration.from_pretrained("hello")
