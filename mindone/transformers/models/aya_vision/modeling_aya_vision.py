@@ -18,7 +18,7 @@ from mindone.transformers.modeling_outputs import BaseModelOutputWithPast, Model
 from mindone.transformers.modeling_utils import PreTrainedModel
 from mindone.transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
-from ..auto import AutoModel
+from mindone.transformers.models.auto import AutoModel
 from .configuration_aya_vision import AyaVisionConfig
 
 class AyaVisionMultiModalProjector(nn.cell):
