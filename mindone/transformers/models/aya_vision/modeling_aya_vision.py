@@ -255,7 +255,7 @@ class AyaVisionModel(AyaVisionPreTrainedModel):
     def construct(
         self,
         input_ids: ms.Tensor = None,
-        pixel_values: ms.FloatTensor = None,
+        pixel_values: ms.Tensor = None,
         attention_mask: Optional[ms.Tensor] = None,
         position_ids: Optional[ms.Tensor] = None,
         past_key_values: Optional[List[ms.Tensor]] = None,
