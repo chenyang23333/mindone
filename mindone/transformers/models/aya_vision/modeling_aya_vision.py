@@ -17,10 +17,9 @@ from mindone.transformers.modeling_flash_attention_utils import FlashAttentionKw
 from mindone.transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from mindone.transformers.modeling_utils import PreTrainedModel
 from mindone.transformers.processing_utils import Unpack
-from mindone.transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
+from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 from ..auto import AutoModel
 from .configuration_aya_vision import AyaVisionConfig
-
 
 class AyaVisionMultiModalProjector(nn.cell):
     def __init__(self, config: AyaVisionConfig):
