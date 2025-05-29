@@ -21,7 +21,7 @@ from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_
 from mindone.transformers.models.auto import AutoModel
 from configuration_aya_vision import AyaVisionConfig
 
-class AyaVisionMultiModalProjector(nn.cell):
+class AyaVisionMultiModalProjector(nn.Cell):
     def __init__(self, config: AyaVisionConfig):
         super().__init__()
         self.config = config
