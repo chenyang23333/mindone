@@ -370,7 +370,7 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
 
-    def get_output_embeddings(self) -> nn.Module:
+    def get_output_embeddings(self) -> nn.Cell:
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
