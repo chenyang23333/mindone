@@ -601,4 +601,5 @@ __all__ = ["AyaVisionForConditionalGeneration", "AyaVisionPreTrainedModel", "Aya
 
 if __name__ == "__main__":
     print("hello world")
-    model = AyaVisionForConditionalGeneration.from_pretrained("hello")
+    local_model_path = "/home/cy/fortransformers/ayavision"
+    model = AyaVisionForConditionalGeneration.from_pretrained(local_model_path)
