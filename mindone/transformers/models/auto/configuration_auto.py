@@ -45,7 +45,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("qwen2", "Qwen2Config"),
         ("t5", "T5Config"),
         ("xlm-roberta", "XLMRobertaConfig"),
-        ("siglip","SiglipVisionConfig")
+        ("siglip_vision_model","SiglipVisionConfig")
     ]
 )
 
@@ -136,6 +136,7 @@ def model_type_to_module_name(key):
     key = key.replace("-", "_")
     if key in DEPRECATED_MODELS:
         key = f"deprecated.{key}"
+
 
     return key
 
