@@ -607,4 +607,5 @@ if __name__ == "__main__":
     print(config_class)
     breakpoint()
     # print(config_class.__name__)
+
     model = AyaVisionForConditionalGeneration.from_pretrained(local_model_path)
