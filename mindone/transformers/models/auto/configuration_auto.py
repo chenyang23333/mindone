@@ -169,6 +169,7 @@ class _LazyConfigMapping(OrderedDict):   # 只在需要的时候才加载对应�
             raise KeyError(key)
         value = self._mapping[key]
         module_name = model_type_to_module_name(key)
+        breakpoint()
         if module_name not in self._modules:
             self._modules[module_name] = importlib.import_module(f".{module_name}", "transformers.models")
         if hasattr(self._modules[module_name], value):
