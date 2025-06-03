@@ -603,7 +603,7 @@ if __name__ == "__main__":
     print("hello world")
     local_model_path = "/home/cy/fortransformers/ayavision"
     from mindone.transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    config_class = CONFIG_MAPPING["siglip_vision_model"]
+    config_class = CONFIG_MAPPING["siglip"]
     print(config_class)
     breakpoint()
     # print(config_class.__name__)
