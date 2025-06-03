@@ -172,12 +172,14 @@ class _LazyConfigMapping(OrderedDict):   # 只在需要的时候才加载对应�
         if module_name not in self._modules:
             self._modules[module_name] = importlib.import_module(f".{module_name}", "transformers.models")
         if hasattr(self._modules[module_name], value):
-            print(self._modules[module_name],"   ", value)
+
             return getattr(self._modules[module_name], value)
+        print(self._modules[module_name], "   ", value)
 
         # Some of the mappings have entries model_type -> config of another model type. In that case we try to grab the
         # object at the top level.
         transformers_module = importlib.import_module("transformers")
+        print(transformers_module, "  transformers_module ", value)
         return getattr(transformers_module, value)
 
     def keys(self):
