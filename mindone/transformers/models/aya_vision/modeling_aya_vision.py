@@ -602,4 +602,7 @@ __all__ = ["AyaVisionForConditionalGeneration", "AyaVisionPreTrainedModel", "Aya
 if __name__ == "__main__":
     print("hello world")
     local_model_path = "/home/cy/fortransformers/ayavision"
+    from mindone.mindone.transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    config_class = CONFIG_MAPPING["siglip_vision_model"]
+    print(config_class.__name__)
     model = AyaVisionForConditionalGeneration.from_pretrained(local_model_path)
