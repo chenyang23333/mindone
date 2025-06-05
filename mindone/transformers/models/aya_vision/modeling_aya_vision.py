@@ -34,7 +34,7 @@ class AyaVisionMultiModalProjector(nn.Cell):
             config.vision_config.hidden_size * (config.downsample_factor**2), eps=config.adapter_layer_norm_eps
         )
 
-        self.linear_1 = nn.Dense(
+        self.linear_1 = mint.nn.Linear(
             config.vision_config.hidden_size * (config.downsample_factor**2),
             self.alignment_intermediate_size,
             bias=True,
@@ -42,7 +42,7 @@ class AyaVisionMultiModalProjector(nn.Cell):
 
         self.act = ACT2FN["silu"]  # SwiGLU uses SiLU activation
         # For SwiGLU, project down to half size since we split intermediate dim
-        self.linear_2 = nn.Dense(self.alignment_intermediate_size // 2, config.text_config.hidden_size, bias=True)
+        self.linear_2 = mint.nn.Linear(self.alignment_intermediate_size // 2, config.text_config.hidden_size, bias=True)
 
     def construct(self, image_features):
         image_features = self.pixel_shuffle(image_features)
@@ -92,11 +92,11 @@ class AyaVisionPreTrainedModel(PreTrainedModel):
             else self.config.text_config.initializer_range
         )
 
-        if isinstance(cell, nn.Dense):
+        if isinstance(cell, mint.nn.Linear):
             cell.weight.data.normal_(mean=0.0, std=std)
             if cell.bias is not None:
                 cell.bias.data.zero_()
-        elif isinstance(cell, nn.LayerNorm):
+        elif isinstance(cell, mint.nn.LayerNorm):
             cell.weight.data.fill_(1.0)
             cell.bias.data.zero_()
 
@@ -362,7 +362,7 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
         breakpoint()
         print("AyaVisionForConditionalGeneration ms inner")
         self.model = AyaVisionModel(config)
-        self.lm_head = nn.Dense(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.lm_head = mint.nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
 
     def get_input_embeddings(self):
