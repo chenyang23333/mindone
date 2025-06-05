@@ -187,7 +187,7 @@ class AyaVisionModel(AyaVisionPreTrainedModel):
         self.vision_tower = AutoModel.from_config(config.vision_config)
 
         self.multi_modal_projector = AyaVisionMultiModalProjector(config)
-        breakpoint()
+        # breakpoint()
         self.language_model = AutoModel.from_config(config.text_config)
         self.post_init()
 
