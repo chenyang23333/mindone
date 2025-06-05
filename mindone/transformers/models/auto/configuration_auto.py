@@ -54,6 +54,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
 MODEL_NAMES_MAPPING = OrderedDict(
     [
         # Add full (and cased) model names here
+        ("aya_vision", "AyaVision"),
         ("bert", "BERT"),
         ("bit", "BiT"),
         ("blip-2", "BLIP-2"),
