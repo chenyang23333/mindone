@@ -359,7 +359,7 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
 
     def __init__(self, config: AyaVisionConfig):
         super().__init__(config)
-        breakpoint()
+        #breakpoint()
         print("AyaVisionForConditionalGeneration ms inner")
         self.model = AyaVisionModel(config)
         self.lm_head = mint.nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)

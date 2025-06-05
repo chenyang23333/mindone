@@ -422,7 +422,7 @@ class _BaseAutoModelClass:
         trust_remote_code = resolve_trust_remote_code(
             trust_remote_code, config._name_or_path, has_local_code, has_remote_code
         )
-        breakpoint()
+        # breakpoint()
 
         if has_remote_code and trust_remote_code:
             class_ref = config.auto_map[cls.__name__]

@@ -50,6 +50,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("siglip_vision_model", "SiglipVisionConfig"),
         ("cohere2", "Cohere2Config"),
         ("aya_vision", "AyaVisionConfig"),
+
     ]
 )
 
@@ -80,6 +81,7 @@ MODEL_NAMES_MAPPING = OrderedDict(
         ("siglip2", "SigLIP2"),
         ("siglip2_vision_model", "Siglip2VisionModel"),
         ("siglip_vision_model", "SiglipVisionModel"),
+        ("cohere2", "Cohere2Model"),
     ]
 )
 
