@@ -76,6 +76,10 @@ MODEL_NAMES_MAPPING = OrderedDict(
         ("t5v1.1", "T5v1.1"),
         ("xlm-roberta", "XLM-RoBERTa"),
         ("xlm-roberta-xl", "XLM-RoBERTa-XL"),
+        ("siglip", "SigLIP"),
+        ("siglip2", "SigLIP2"),
+        ("siglip2_vision_model", "Siglip2VisionModel"),
+        ("siglip_vision_model", "SiglipVisionModel"),
     ]
 )
 
