@@ -47,6 +47,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("xlm-roberta", "XLMRobertaConfig"),
         ("siglip_vision_model","SiglipVisionConfig"),
         ("cohere2", "Cohere2Config"),
+        ("aya_vision", "AyaVisionConfig"),
     ]
 )
 

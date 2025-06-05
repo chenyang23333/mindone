@@ -41,7 +41,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("mt5", "MT5Model"),
         ("t5", "T5Model"),
         ("xlm-roberta", "XLMRobertaModel"),
-         ("aya_vision", "AyaVisionModel"),
+        ("aya_vision", "AyaVisionModel"),
     ]
 )
 
