@@ -20,6 +20,7 @@ from mindone.transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 from mindone.transformers.models.auto import AutoModel
 from configuration_aya_vision import AyaVisionConfig
+import mindspore.mint as mint
 
 class AyaVisionMultiModalProjector(nn.Cell):
     def __init__(self, config: AyaVisionConfig):
@@ -29,7 +30,7 @@ class AyaVisionMultiModalProjector(nn.Cell):
         self.alignment_intermediate_size = getattr(
             config, "alignment_intermediate_size", config.text_config.hidden_size
         )
-        self.layernorm = nn.LayerNorm(
+        self.layernorm = mint.nn.LayerNorm(
             config.vision_config.hidden_size * (config.downsample_factor**2), eps=config.adapter_layer_norm_eps
         )
 
