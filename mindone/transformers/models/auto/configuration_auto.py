@@ -45,7 +45,9 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("qwen2", "Qwen2Config"),
         ("t5", "T5Config"),
         ("xlm-roberta", "XLMRobertaConfig"),
-        ("siglip_vision_model","SiglipVisionConfig"),
+        ("siglip", "SiglipConfig"),
+        ("siglip2", "Siglip2Config"),
+        ("siglip_vision_model", "SiglipVisionConfig"),
         ("cohere2", "Cohere2Config"),
         ("aya_vision", "AyaVisionConfig"),
     ]
