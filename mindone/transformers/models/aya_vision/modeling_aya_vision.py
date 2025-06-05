@@ -187,6 +187,7 @@ class AyaVisionModel(AyaVisionPreTrainedModel):
         self.vision_tower = AutoModel.from_config(config.vision_config)
 
         self.multi_modal_projector = AyaVisionMultiModalProjector(config)
+        breakpoint()
         self.language_model = AutoModel.from_config(config.text_config)
         self.post_init()
 
@@ -360,7 +361,6 @@ class AyaVisionForConditionalGeneration(AyaVisionPreTrainedModel, GenerationMixi
     def __init__(self, config: AyaVisionConfig):
         super().__init__(config)
         #breakpoint()
-        print("AyaVisionForConditionalGeneration ms inner")
         self.model = AyaVisionModel(config)
         self.lm_head = mint.nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
